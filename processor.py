@@ -65,9 +65,9 @@ class SeismicProcessor:
     def __init__(self, event_queue=None, p_onset_callback=None, scope_id_callback=None):
         self.sample_rate = config.SAMPLE_RATE
         self.dt = 1.0 / config.SAMPLE_RATE
-        self.buffer_size = int(
-            max(80, config.SNAPSHOT_PRE_P_SEC + config.SNAPSHOT_POST_P_SEC + 20) * config.SAMPLE_RATE
-        )
+        self.warmup_until = time.time() + config.ADC_WARMUP_SEC
+        self.buffer_size = int(max(80, config.SNAPSHOT_PRE_P_SEC + config.SNAPSHOT_POST_P_SEC + 20) * config.SAMPLE_RATE)
+        
         self.buf_z = np.zeros(self.buffer_size, dtype=np.float64)
         self.buf_n = np.zeros(self.buffer_size, dtype=np.float64)
         self.buf_e = np.zeros(self.buffer_size, dtype=np.float64)
@@ -377,9 +377,29 @@ class SeismicProcessor:
                     logger.warning("[DISPATCHER] QUEUE FULL, event dropped")
 
     def process_batch(self, batch_raws, batch_timestamps):
+        in_warmup = time.time() < self.warmup_until
         for raw, ts in zip(batch_raws, batch_timestamps):
-            self.process_single(raw, ts)
+            if len(raw) < 3:
+                continue
+            self._append(raw[0], raw[1], raw[2], ts)
+            current_t = float(ts)
+            abs_z = abs(float(raw[2]))
+            self.latest_t = current_t
+            self._update_envelope(abs_z)
+            self._update_noise_stats(current_t)
 
+            if in_warmup:
+                continue   # буферы наполняем, onset не ищем
+
+            current_idx = self._current_chronological_idx()
+            self._update_trackers(current_idx, current_t, abs_z)
+            self._check_onset_fast(current_idx, current_t, abs_z)
+            self.samples_since_heavy += 1
+            if self.samples_since_heavy >= int(self.heavy_interval * self.sample_rate):
+                self.samples_since_heavy = 0
+                self._refine_active_onsets()
+                self._flush_ended_trackers()
+                
     def process_single(self, raw, timestamp):
         if len(raw) < 3:
             return None

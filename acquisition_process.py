@@ -96,6 +96,17 @@ class DataAcquisitionProcess(multiprocessing.Process):
                 volts, raws = adc.read_4ch_fixed_delay()
                 sample_utc = time.time()
                 self.sample_counter += 1
+                
+                warmup_samples = int(self.sample_rate * config.ADC_WARMUP_SEC)
+                if self.sample_counter == warmup_samples:
+                    logger.info(
+                        f"[DAQ {config.VERSION}] ADC warmup finished "
+                        f"({config.ADC_WARMUP_SEC:.1f}s, {warmup_samples} samples) — data flow started"
+                        )
+                    # --- Прогрев АЦП: первые N секунд не отправляем ---
+                if self.sample_counter < int(self.sample_rate * config.ADC_WARMUP_SEC):
+                    continue
+                    
                 batch_volts.append(volts)
                 batch_raws.append(raws)
                 batch_ts.append(sample_utc)
