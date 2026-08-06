@@ -1,0 +1,44 @@
+seismic_station_v9.4.0
+|
++-- AD7606B.py              # Драйвер АЦП (SPI + GPIO). v9.3.2, без изменений.
+|
++-- config.py               # Конфигурация системы. v9.4.0
+|                           # Исправлен S_SEARCH_POST_P_END_SEC, добавлен DAQ_QUEUE_MAXSIZE,
+|                           # VERSION = "v9.4.0".
+|
++-- acquisition_process.py  # НОВЫЙ — DAQ в отдельном процессе (multiprocessing.Process).
+|                           # Полностью устраняет GIL contention. CPU affinity {0,3}.
+|
++-- processor.py            # SeismicProcessor (Obspy + SciPy). v9.3.2, без изменений.
+|
++-- heavy_worker.py         # Процесс heavy worker. v9.3.2, без изменений.
+|
++-- widgets.py              # MapWidget + OscilloscopeWidget (PyQtGraph). v9.3.2, без изменений.
+|
++-- main.py                 # Главное окно. v9.4.0
+|                           # mp.Process + poll timer (50 мс) вместо QThread + pyqtSignal.
+|                           # Очередь multiprocessing.Queue для данных от DAQ.
+|
+L-- structure.txt           # Описание структуры проекта v9.4.0.
+
+
+КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ v9.4.0:
+1. Новая архитектура DAQ:
+   - DataAcquisitionProcess(multiprocessing.Process) в acquisition_process.py.
+   - DAQ и GUI работают в разных процессах → разные GIL → нет contention.
+   - Данные передаются через multiprocessing.Queue (maxsize=50).
+
+2. main.py:
+   - Убран DataAcquisitionThread (QThread).
+   - Добавлен poll timer (50 мс) для чтения из mp.Queue.
+   - closeEvent: корректная остановка DAQ процесса (join → terminate).
+
+3. config.py:
+   - VERSION = "v9.4.0".
+   - Добавлен DAQ_QUEUE_MAXSIZE = 50.
+   - Исправлен баг: S_SEARCH_POST_P_END_SEC = 0.5 восстановлен.
+
+4. Ожидаемый результат:
+   - Потери данных < 5% (цель < 1-2%).
+   - Пилообразный тренд потерь исчезает.
+   - Стабильная работа часами без деградации.
