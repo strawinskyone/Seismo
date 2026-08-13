@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+
 import os, sys, time, numpy as np, logging
 from logging.handlers import RotatingFileHandler
 from multiprocessing import Process, Queue, Event
 from PyQt5.QtWidgets import QApplication, QMainWindow, QHBoxLayout, QVBoxLayout, QWidget
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, Qt
+from test_events import inject_test_events
 import config
 from config import *
 from acquisition_process import DataAcquisitionProcess
@@ -88,7 +90,7 @@ class SeismicMonitor(QMainWindow):
 
         self.daq_timer = QTimer()
         self.daq_timer.timeout.connect(self._poll_daq_queue)
-        self.daq_timer.start(100)
+        self.daq_timer.start(20)
 
     def _poll_daq_queue(self):
         while not self.data_queue.empty():
@@ -124,8 +126,8 @@ class SeismicMonitor(QMainWindow):
             try:
                 result = self.result_queue.get_nowait()
                 if not result or result.get('status') != 'event': continue
-                distance = result.get('distance', 0)
-                if distance <= DEAD_ZONE_KM: continue
+                distance = result.get('distance')
+                if distance is not None and distance <= DEAD_ZONE_KM: continue
                 added = self.map.add_event(result)
                 if not added: continue
                 self.event_count += 1
@@ -134,10 +136,13 @@ class SeismicMonitor(QMainWindow):
                 depth = result.get('depth', 0); etype = result.get('event_type', '?'); p_s = result.get('p_s_delta', 0)
                 s_time_abs = result.get('s_time_abs')
                 if s_time_abs: self.scopes[0].add_s_marker(s_time_abs)
+                dist_str = f"{distance:5.1f}km" if distance is not None else "N/A   "
+                depth_str = f"{depth:4.1f}km" if depth is not None else "N/A "
+                p_s_str = f"{p_s:.2f}s" if p_s and p_s > 0 else "N/A"
                 event_line = (f"EVENT #{self.event_count:03d} | {etype.upper():>6s} | "
-                              f"D={distance:5.1f}km | Ml={ml:4.2f} | Az={az:5.1f}° | "
-                              f"conf={conf:.2f} | depth={depth:4.1f}km | peak={peak_mv:5.2f}mV | "
-                              f"ΔP-S={p_s:.2f}s")
+                              f"D={dist_str} | Ml={ml:4.2f} | Az={az:5.1f}° | "
+                              f"conf={conf:.2f} | depth={depth_str} | peak={peak_mv:5.2f}mV | "
+                              f"ΔP-S={p_s_str}")
                 events_logger.info(event_line); logger.info(f"[EVENT] {event_line}")
                 self.last_event_display = f"#{self.event_count} {etype} {distance:.1f}km"
                 self.setWindowTitle(f"Сейсмостанция {config.VERSION} | {self.last_event_display} | ±{GRAPH_SENSITIVITY_MV}mV")
@@ -160,9 +165,26 @@ class SeismicMonitor(QMainWindow):
             logger.warning("[MAIN] Heavy worker terminated forcefully")
         event.accept()
 
+    def keyPressEvent(self, event):
+        # Горячие клавиши главного окна.
+        key = event.key()
+        if key == Qt.Key_J:
+            inject_test_events(self.map, self.scopes)
+            self.setWindowTitle(
+                f"Сейсмостанция {config.VERSION} | ТЕСТ: события на карте | ±{GRAPH_SENSITIVITY_MV}mV"
+            )
+        else:
+            super().keyPressEvent(event)
+
 if __name__ == "__main__":
     try: import obspy, scipy, numpy, PyQt5, pyqtgraph
     except ImportError as e: print(f"\n❌ Отсутствует: {e.name}"); sys.exit(1)
     config.setup_logging()
+    try:
+        config.validate_config()
+        logger.info("[MAIN] Config validation PASSED")
+    except AssertionError as e:
+        print(f"\n❌ ОШИБКА КОНФИГУРАЦИИ: {e}")
+        sys.exit(1)
     app = QApplication(sys.argv); window = SeismicMonitor(); window.show()
     sys.exit(app.exec_())

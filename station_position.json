@@ -1,5 +1,7 @@
 {
-  "station_offset_x": 0,
-  "station_offset_y": 0,
-  "map_scale": 0.4950617283950617
+  "station_offset_x": -142,
+  "station_offset_y": -160,
+  "map_offset_x": 67,
+  "map_offset_y": 88,
+  "pixel_scale": 1.0436898550720661
 }

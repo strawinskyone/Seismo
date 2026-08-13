@@ -76,10 +76,11 @@ class AD7606B:
         self._reg_write(0x00, 0x00)
 
     def _choose_oversampling(self, sample_rate):
-        if sample_rate <= 100: return 0x06
-        if sample_rate <= 300: return 0x04
-        if sample_rate <= 600: return 0x02
-        return 0x00
+        if sample_rate <= 100: return 0x08   # 256×
+        if sample_rate <= 200: return 0x07   # 128×
+        if sample_rate <= 400: return 0x08   # 64×  ← или 0x08, если CPU тянет
+        if sample_rate <= 600: return 0x04   # 16×
+        return 0x02                          # 4×
 
     def _reg_write(self, addr, data):
         word = ((addr & 0x3F) << 8) | (data & 0xFF)

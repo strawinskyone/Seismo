@@ -54,8 +54,8 @@ class EventTracker:
                 reason = 'timeout' if timeout else 'envelope_decay'
                 logger.info(
                     f"[TRACKER] P_END @ {current_time:.3f} "
-                    f"(reason={reason}, peak={self.p_peak:.1f}, "
-                    f"thr={adaptive_end_thr:.1f}, dur={p_duration:.2f}s)"
+                    f"(reason={reason}, peak={self.p_peak:.2f}, "
+                    f"thr={adaptive_end_thr:.2f}, dur={p_duration:.2f}s)"
                 )
         elif self.state in ('P_ENDED', 'CLOSED'):
             pass
@@ -66,8 +66,8 @@ class SeismicProcessor:
         self.sample_rate = config.SAMPLE_RATE
         self.dt = 1.0 / config.SAMPLE_RATE
         self.warmup_until = time.time() + config.ADC_WARMUP_SEC
-        self.buffer_size = int(max(80, config.SNAPSHOT_PRE_P_SEC + config.SNAPSHOT_POST_P_SEC + 20) * config.SAMPLE_RATE)
-        
+        self.buffer_size = config.BUFFER_SIZE
+
         self.buf_z = np.zeros(self.buffer_size, dtype=np.float64)
         self.buf_n = np.zeros(self.buffer_size, dtype=np.float64)
         self.buf_e = np.zeros(self.buffer_size, dtype=np.float64)
@@ -75,27 +75,41 @@ class SeismicProcessor:
         self.buf_idx = 0
         self.buf_filled = False
 
-        env_win = max(1, int(config.ENVELOPE_WIN_SEC * self.sample_rate))
-        self.env_abs_buf = np.zeros(env_win, dtype=np.float64)
+        # --- v9.5.1: Поканальная RMS-нормализация (SNR) с floor ---
+        self.noise_rms_n = 1.0
+        self.noise_rms_e = 1.0
+        self.noise_rms_z = 1.0
+        self.rms_alpha = 1.0 / (2.0 * self.sample_rate)   # EMA tau = 2 сек
+        self.rms_floor = 0.5                              # минимум 0.5 LSB
+
+        # --- v9.5.1: Realtime recursive STA/LTA с корректной init ---
+        self.sta_val = 1.0
+        self.lta_val = 1.0
+        self.sta_alpha = 1.0 / (config.P_STA_SEC * self.sample_rate)
+        self.lta_alpha = 1.0 / (config.P_LTA_SEC * self.sample_rate)
+        self.sta_lta_ratio = 0.0
+        self.sta_lta_triggered = False
+        self.last_sta_lta_onset_t = 0.0
+
+        self.env_abs_buf = np.zeros(config.ENVELOPE_WIN_N, dtype=np.float64)
         self.env_buf_idx = 0
         self.global_env = 0.0
 
-        noise_len = int(config.NOISE_ESTIMATE_SEC * self.sample_rate)
-        self.noise_env_history = np.zeros(noise_len, dtype=np.float64)
+        self.noise_env_history = np.zeros(config.NOISE_ESTIMATE_N, dtype=np.float64)
         self.noise_hist_idx = 0
         self.noise_hist_filled = False
 
-        deriv_len = max(100, int(config.NOISE_ESTIMATE_SEC * self.sample_rate))
-        self.deriv_history = np.zeros(deriv_len, dtype=np.float64)
+        self.deriv_history = np.zeros(config.DERIV_HISTORY_N, dtype=np.float64)
         self.deriv_hist_idx = 0
 
-        self.noise_floor = (config.EVENT_THRESHOLD_MV / 1000.0) / config.ADC_SCALE_V
-        self.noise_rms = self.noise_floor * 0.5
-        self.threshold_derivative = self.noise_floor * 10.0
+        # v9.5.1: noise_floor в SNR-единицах, floor = 0.1
+        self.noise_floor = 1.0
+        self.noise_rms = 0.5
+        self.threshold_derivative = 5.0
         self.last_noise_update = 0.0
 
-        delay = max(1, int(0.1 * self.sample_rate))
-        self.env_history = np.zeros(delay * 2, dtype=np.float64)
+        delay = config.ENVELOPE_DELAY_N * 2
+        self.env_history = np.zeros(delay, dtype=np.float64)
         self.env_hist_idx = 0
         self.env_hist_count = 0
 
@@ -103,16 +117,23 @@ class SeismicProcessor:
         self.max_trackers = config.MAX_TRACKERS
         self.recent_events = []
         self.samples_since_heavy = 0
-        self.heavy_interval = config.HEAVY_PROCESS_INTERVAL_SEC
+        self.heavy_interval = config.HEAVY_PROCESS_INTERVAL_N
         self.event_queue = event_queue
         self.p_onset_callback = p_onset_callback
         self.scope_id_callback = scope_id_callback
         self.latest_t = 0.0
 
+        # --- DC offset removal (EMA, tau = 10 s) ---
+        self.dc_z = 0.0
+        self.dc_n = 0.0
+        self.dc_e = 0.0
+        self.dc_alpha = 1.0 / (10.0 * self.sample_rate)
+
         logger.info(
             f"[PROCESSOR {config.VERSION}] Init: SR={config.SAMPLE_RATE}, "
-            f"buf={self.buffer_size} samp ({self.buffer_size/self.sample_rate:.1f}s), "
-            f"max_trackers={config.MAX_TRACKERS}"
+            f"buf={self.buffer_size} samp ({self.buffer_size/config.SAMPLE_RATE:.1f}s), "
+            f"max_trackers={config.MAX_TRACKERS}, DC_EMA_tau=10s, "
+            f"RMS_EMA_tau=2s, RMS_floor={self.rms_floor}, STA/LTA_realtime=ON"
         )
 
     def _append(self, x, y, z, t):
@@ -142,8 +163,8 @@ class SeismicProcessor:
             return max(0, self.buf_idx - 1)
         return self.buffer_size - 1
 
-    def _update_envelope(self, abs_z):
-        self.env_abs_buf[self.env_buf_idx] = abs_z
+    def _update_envelope(self, abs_val):
+        self.env_abs_buf[self.env_buf_idx] = abs_val
         self.env_buf_idx = (self.env_buf_idx + 1) % len(self.env_abs_buf)
         self.global_env = float(np.max(self.env_abs_buf))
         self.noise_env_history[self.noise_hist_idx] = self.global_env
@@ -167,7 +188,9 @@ class SeismicProcessor:
         hist = (self.noise_env_history if self.noise_hist_filled
                 else self.noise_env_history[:self.noise_hist_idx])
         if len(hist) > 100:
-            self.noise_floor = float(np.percentile(hist, config.NOISE_PERCENTILE))
+            # v9.5.1: floor для noise_floor, чтобы не было 0
+            raw_nf = float(np.percentile(hist, config.NOISE_PERCENTILE))
+            self.noise_floor = max(raw_nf, 0.1)
             quiet = hist[hist < self.noise_floor * 2.0]
             if len(quiet) > 10:
                 self.noise_rms = float(np.sqrt(np.mean((quiet - self.noise_floor) ** 2)))
@@ -181,6 +204,8 @@ class SeismicProcessor:
                 self.noise_rms * 2.0,
                 median_d + config.ONSET_DERIVATIVE_FACTOR * max(mad, self.noise_rms * 0.1)
             )
+            # v9.5.1: floor для порога производной
+            self.threshold_derivative = max(self.threshold_derivative, 0.5)
 
     def _adaptive_p_end_threshold(self, tracker):
         abs_thr = self.noise_floor * config.P_END_ABS_FACTOR
@@ -190,10 +215,10 @@ class SeismicProcessor:
         rel_thr = tracker.p_peak * rel_factor
         return max(abs_thr, rel_thr)
 
-    def _check_onset_fast(self, current_idx, current_t, abs_z):
+    def _check_onset_fast(self, current_idx, current_t, abs_snr_z):
         if self.global_env < self.noise_floor * config.SNR_THRESHOLD:
             return False
-        delay = max(1, int(0.1 * self.sample_rate))
+        delay = config.ENVELOPE_DELAY_N
         env_delayed = self._get_delayed_envelope(delay)
         d_env = (self.global_env - env_delayed) / (delay * self.dt)
         self.deriv_history[self.deriv_hist_idx] = d_env
@@ -237,8 +262,65 @@ class SeismicProcessor:
         self.active_trackers.append(tracker)
         logger.info(
             f"[ONSET] New tracker @ {current_t:.3f} "
-            f"(env={self.global_env:.1f}, d_env={d_env:.1f}, "
-            f"noise_floor={self.noise_floor:.1f}, scope={scope_id})"
+            f"(env={self.global_env:.2f}, d_env={d_env:.2f}, "
+            f"noise_floor={self.noise_floor:.2f}, scope={scope_id})"
+        )
+        if self.p_onset_callback:
+            self.p_onset_callback(current_t)
+        return True
+
+    # --- v9.5.1: Realtime recursive STA/LTA onset detector ---
+    def _check_sta_lta_onset(self, current_idx, current_t, abs_snr_z):
+        if not self.noise_hist_filled:
+            return False
+        if self.sta_lta_ratio < config.P_TRIGGER_RATIO:
+            # Сброс триггера при возврате ниже detrigger
+            if self.sta_lta_triggered and self.sta_lta_ratio < config.P_DETRIGGER_RATIO:
+                self.sta_lta_triggered = False
+            return False
+        if self.sta_lta_triggered:
+            return False
+        # Дебаунс
+        debounce_sec = config.EVENT_DEBOUNCE_MS / 1000.0
+        for closed_t, _ in self.recent_events:
+            if abs(current_t - closed_t) < debounce_sec:
+                return False
+        for trk in self.active_trackers:
+            if trk.state in ('P_RISING', 'P_PEAKED'):
+                if abs(trk.onset_time - current_t) < config.ONSET_GUARD_SEC:
+                    return False
+        if len(self.active_trackers) >= self.max_trackers:
+            oldest = None
+            for trk in self.active_trackers:
+                if trk.state == 'P_ENDED':
+                    oldest = trk
+                    break
+            if oldest is None:
+                for trk in self.active_trackers:
+                    if trk.state == 'P_PEAKED':
+                        oldest = trk
+                        break
+            if oldest is not None:
+                self.active_trackers.remove(oldest)
+            else:
+                return False
+        scope_id = 0
+        if self.scope_id_callback:
+            try:
+                scope_id = self.scope_id_callback()
+            except Exception:
+                pass
+        tracker = EventTracker(
+            onset_idx=current_idx, onset_time=current_t,
+            p_idx=current_idx, p_time_abs=current_t,
+            sample_rate=self.sample_rate, scope_id=scope_id
+        )
+        self.active_trackers.append(tracker)
+        self.sta_lta_triggered = True
+        logger.info(
+            f"[STA/LTA ONSET] New tracker @ {current_t:.3f} "
+            f"(ratio={self.sta_lta_ratio:.2f}, sta={self.sta_val:.3f}, "
+            f"lta={self.lta_val:.3f}, scope={scope_id})"
         )
         if self.p_onset_callback:
             self.p_onset_callback(current_t)
@@ -273,9 +355,18 @@ class SeismicProcessor:
             z_filt = signal.sosfiltfilt(sos, z_win)
         except Exception:
             z_filt = z_win
-        data = np.abs(z_filt)
-        sta_n = max(1, int(config.P_STA_SEC * self.sample_rate))
-        lta_n = max(1, int(config.P_LTA_SEC * self.sample_rate))
+
+        # --- v9.5.1: Поканальная нормализация по дисперсии фона ---
+        quiet_len = min(len(z_filt) // 2, int(config.P_LTA_SEC * self.sample_rate))
+        if quiet_len > 100:
+            quiet_std = np.std(z_filt[:quiet_len])
+            z_filt_norm = z_filt / (quiet_std + 1e-12)
+        else:
+            z_filt_norm = z_filt
+
+        data = np.abs(z_filt_norm)
+        sta_n = config.P_STA_N
+        lta_n = config.P_LTA_N
         if len(data) < lta_n + sta_n:
             return float(t_chron[a]), a
         sta = np.convolve(data, np.ones(sta_n) / sta_n, mode='valid')
@@ -310,12 +401,10 @@ class SeismicProcessor:
             return None
         p_idx = int((p_time_abs - t[0]) * self.sample_rate)
         p_idx = max(0, min(p_idx, len(t) - 1))
-        pre_samples = int(config.SNAPSHOT_PRE_P_SEC * self.sample_rate)
-        post_samples = int(config.SNAPSHOT_POST_P_SEC * self.sample_rate)
+        pre_samples = config.SNAPSHOT_PRE_P_N
+        post_samples = config.SNAPSHOT_POST_P_N
         a = max(0, p_idx - pre_samples)
         b = min(len(t), p_idx + post_samples)
-        # FIX v9.4.1: p_end_idx — кольцевой индекс, теряет смысл при обёртке.
-        # Используем p_end_time (абсолютное время) для корректного индекса в snapshot.
         if tracker.p_end_time is not None:
             p_end_snapshot = int((tracker.p_end_time - t[0]) * self.sample_rate) - a
             p_end_snapshot = max(0, min(p_end_snapshot, b - a - 1))
@@ -327,19 +416,17 @@ class SeismicProcessor:
             'sample_rate': self.sample_rate, 'scope_id': tracker.scope_id,
         }
 
-    def _update_trackers(self, current_idx, current_t, abs_z):
+    def _update_trackers(self, current_idx, current_t, abs_snr_z):
         for tracker in self.active_trackers:
             if tracker.state in ('P_RISING', 'P_PEAKED'):
                 adaptive_thr = self._adaptive_p_end_threshold(tracker)
-                tracker.update(current_idx, current_t, abs_z, self.global_env, adaptive_thr)
+                tracker.update(current_idx, current_t, abs_snr_z, self.global_env, adaptive_thr)
 
     def _flush_ended_trackers(self):
         ready = []
         remaining = []
         for tracker in self.active_trackers:
             if tracker.state == 'P_ENDED':
-                # FIX v9.4.1: не сбрасываем, пока в буфере не накопилось
-                # достаточно данных после P для полноценного snapshot.
                 required_t = tracker.p_time_abs + config.SNAPSHOT_POST_P_SEC
                 if self.latest_t < required_t:
                     if not tracker.flush_delay_logged:
@@ -371,7 +458,9 @@ class SeismicProcessor:
                     logger.info(
                         f"[DISPATCHER] Snapshot sent "
                         f"(P @ {p_t:.3f}, P_end @ {pe_t:.3f}, "
-                        f"len={len(snapshot['z'])}, scope={snapshot['scope_id']})"
+                        f"len={len(snapshot['z'])}, scope={snapshot['scope_id']}, "
+                        f"trackers_active={len(self.active_trackers)}, "
+                        f"buf_filled={self.buf_filled})"
                     )
                 except Exception:
                     logger.warning("[DISPATCHER] QUEUE FULL, event dropped")
@@ -381,39 +470,122 @@ class SeismicProcessor:
         for raw, ts in zip(batch_raws, batch_timestamps):
             if len(raw) < 3:
                 continue
-            self._append(raw[0], raw[1], raw[2], ts)
+
+            # --- Вычитание DC (EMA) ---
+            n_val = float(raw[0])
+            e_val = float(raw[1])
+            z_val = float(raw[2])
+
+            self.dc_n += self.dc_alpha * (n_val - self.dc_n)
+            self.dc_e += self.dc_alpha * (e_val - self.dc_e)
+            self.dc_z += self.dc_alpha * (z_val - self.dc_z)
+
+            n_cent = n_val - self.dc_n
+            e_cent = e_val - self.dc_e
+            z_cent = z_val - self.dc_z
+
+            # --- v9.5.1: Поканальная RMS-нормализация (SNR) с floor ---
+            abs_n = abs(n_cent)
+            abs_e = abs(e_cent)
+            abs_z = abs(z_cent)
+
+            # Обновляем RMS только на "тихих" участках (ниже 2*noise_floor)
+            if abs_n < self.noise_floor * 2.0:
+                self.noise_rms_n += self.rms_alpha * (n_cent**2 - self.noise_rms_n)
+            if abs_e < self.noise_floor * 2.0:
+                self.noise_rms_e += self.rms_alpha * (e_cent**2 - self.noise_rms_e)
+            if abs_z < self.noise_floor * 2.0:
+                self.noise_rms_z += self.rms_alpha * (z_cent**2 - self.noise_rms_z)
+
+            # v9.5.1: floor для RMS, чтобы не было деления на 0
+            rms_n = max(np.sqrt(self.noise_rms_n), self.rms_floor)
+            rms_e = max(np.sqrt(self.noise_rms_e), self.rms_floor)
+            rms_z = max(np.sqrt(self.noise_rms_z), self.rms_floor)
+
+            snr_n = n_cent / rms_n
+            snr_e = e_cent / rms_e
+            snr_z = z_cent / rms_z
+
+            abs_snr_z = abs(snr_z)
+
+            self._append(n_cent, e_cent, z_cent, ts)
             current_t = float(ts)
-            abs_z = abs(float(raw[2]))
             self.latest_t = current_t
-            self._update_envelope(abs_z)
+
+            # --- v9.5.1: Обновление envelope на SNR-нормализованном Z ---
+            self._update_envelope(abs_snr_z)
             self._update_noise_stats(current_t)
 
-            if in_warmup:
+            # --- v9.5.1: Realtime recursive STA/LTA на abs_snr_z ---
+            # Инициализация sta/lta через текущее значение, но не ниже 0.1
+            sample = max(abs_snr_z, 0.1)
+            self.lta_val += self.lta_alpha * (sample - self.lta_val)
+            self.sta_val += self.sta_alpha * (sample - self.sta_val)
+            self.sta_lta_ratio = self.sta_val / (self.lta_val + 1e-12)
+
+            if in_warmup or not self.noise_hist_filled:
                 continue   # буферы наполняем, onset не ищем
 
             current_idx = self._current_chronological_idx()
-            self._update_trackers(current_idx, current_t, abs_z)
-            self._check_onset_fast(current_idx, current_t, abs_z)
+            self._update_trackers(current_idx, current_t, abs_snr_z)
+            self._check_onset_fast(current_idx, current_t, abs_snr_z)
+            self._check_sta_lta_onset(current_idx, current_t, abs_snr_z)
             self.samples_since_heavy += 1
-            if self.samples_since_heavy >= int(self.heavy_interval * self.sample_rate):
+            if self.samples_since_heavy >= self.heavy_interval:
                 self.samples_since_heavy = 0
                 self._refine_active_onsets()
                 self._flush_ended_trackers()
-                
+
     def process_single(self, raw, timestamp):
         if len(raw) < 3:
             return None
-        self._append(raw[0], raw[1], raw[2], timestamp)
+
+        n_val = float(raw[0])
+        e_val = float(raw[1])
+        z_val = float(raw[2])
+
+        self.dc_n += self.dc_alpha * (n_val - self.dc_n)
+        self.dc_e += self.dc_alpha * (e_val - self.dc_e)
+        self.dc_z += self.dc_alpha * (z_val - self.dc_z)
+
+        n_cent = n_val - self.dc_n
+        e_cent = e_val - self.dc_e
+        z_cent = z_val - self.dc_z
+
+        # --- v9.5.1: SNR с floor ---
+        if abs(n_cent) < self.noise_floor * 2.0:
+            self.noise_rms_n += self.rms_alpha * (n_cent**2 - self.noise_rms_n)
+        if abs(e_cent) < self.noise_floor * 2.0:
+            self.noise_rms_e += self.rms_alpha * (e_cent**2 - self.noise_rms_e)
+        if abs(z_cent) < self.noise_floor * 2.0:
+            self.noise_rms_z += self.rms_alpha * (z_cent**2 - self.noise_rms_z)
+
+        rms_n = max(np.sqrt(self.noise_rms_n), self.rms_floor)
+        rms_e = max(np.sqrt(self.noise_rms_e), self.rms_floor)
+        rms_z = max(np.sqrt(self.noise_rms_z), self.rms_floor)
+        snr_n = n_cent / rms_n
+        snr_e = e_cent / rms_e
+        snr_z = z_cent / rms_z
+        abs_snr_z = abs(snr_z)
+
+        self._append(n_cent, e_cent, z_cent, timestamp)
         current_t = float(timestamp)
-        abs_z = abs(float(raw[2]))
-        current_idx = self._current_chronological_idx()
         self.latest_t = current_t
-        self._update_envelope(abs_z)
+
+        self._update_envelope(abs_snr_z)
         self._update_noise_stats(current_t)
-        self._update_trackers(current_idx, current_t, abs_z)
-        self._check_onset_fast(current_idx, current_t, abs_z)
+
+        sample = max(abs_snr_z, 0.1)
+        self.lta_val += self.lta_alpha * (sample - self.lta_val)
+        self.sta_val += self.sta_alpha * (sample - self.sta_val)
+        self.sta_lta_ratio = self.sta_val / (self.lta_val + 1e-12)
+
+        current_idx = self._current_chronological_idx()
+        self._update_trackers(current_idx, current_t, abs_snr_z)
+        self._check_onset_fast(current_idx, current_t, abs_snr_z)
+        self._check_sta_lta_onset(current_idx, current_t, abs_snr_z)
         self.samples_since_heavy += 1
-        if self.samples_since_heavy >= int(self.heavy_interval * self.sample_rate):
+        if self.samples_since_heavy >= self.heavy_interval:
             self.samples_since_heavy = 0
             self._refine_active_onsets()
             self._flush_ended_trackers()

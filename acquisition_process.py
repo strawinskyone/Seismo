@@ -77,14 +77,15 @@ class DataAcquisitionProcess(multiprocessing.Process):
                 drift_ms = drift * 1000.0
                 samples_missed = int(drift / interval)
                 now_t = time.time()
-                if now_t - self._last_drift_log >= 5.0:
-                    if drift_ms > 20.0:
+                if drift_ms > 50.0:
+                    if now_t - self._last_drift_log >= 5.0:
                         logger.warning(
                             f"[DAQ {config.VERSION}] Timing drift {drift_ms:.1f} ms "
                             f"({samples_missed} samples), resyncing"
                         )
                         self._last_drift_log = now_t
-                    elif drift_ms > 5.0:
+                elif drift_ms > 15.0:
+                    if now_t - self._last_drift_log >= 60.0:
                         logger.debug(
                             f"[DAQ {config.VERSION}] Timing drift {drift_ms:.1f} ms "
                             f"({samples_missed} samples), resyncing"
