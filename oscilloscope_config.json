@@ -3,8 +3,8 @@
   "channel_configs": [
     {"name": "X", "color": "#FF8C00", "offset": 0.0, "sensitivity_v": 1.0, "enabled": true},
     {"name": "Y", "color": "#228B22", "offset": -0.05, "sensitivity_v": 1.0, "enabled": true},
-    {"name": "Z", "color": "#0000FF", "offset": -0.2,  "sensitivity_v": 1.0, "enabled": true},
-    {"name": "Obspy Vector", "color": "#FFFFFF", "offset": -0.25, "sensitivity_v": 1.0, "enabled": true}
+    {"name": "Z", "color": "#0000FF", "offset": -0.1,  "sensitivity_v": 1.0, "enabled": true},
+    {"name": "Obspy Vector", "color": "#FFFFFF", "offset": -0.5, "sensitivity_v": 1.0, "enabled": true}
   ],
   "line_width": 1.5
 }
