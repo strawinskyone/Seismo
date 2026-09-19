@@ -1,3 +1,13 @@
+"""
+widgets.py v9.6.5
+Изменения v9.6.5:
+- SeismicEvent: безопасная обработка None (magnitude, ml_magnitude).
+- get_pulse_radius: конфигурируемый радиус (PULSE_USE_MAGNITUDE / PULSE_BASE_RADIUS_KM).
+- _group_events_by_location: без мутации (clone()).
+- Удалён _last_ymax.
+- _draw_event_labels / paintEvent: рисуется "M?" при NaN ml_magnitude.
+- Отображение — по evt.ml_magnitude (не по RSAM magnitude).
+"""
 from PyQt5.QtWidgets import QWidget, QVBoxLayout
 from PyQt5.QtGui import QPainter, QPen, QColor, QPolygon, QFont, QPixmap, QCursor, QPainterPath
 from PyQt5.QtCore import Qt, QTimer, QPoint, pyqtSignal, QRect, QRectF
@@ -22,18 +32,30 @@ try:
     DS = getattr(config, 'CAROUSEL_DOWNSAMPLE', 1)
     SENS = getattr(config, 'GRAPH_SENSITIVITY_MV', 100.0) / 1000.0
     SR = getattr(config, 'SAMPLE_RATE', 400)
+    # v9.6.x: параметры пульса
+    PULSE_USE_MAGNITUDE = getattr(config, 'PULSE_USE_MAGNITUDE', False)
+    PULSE_BASE_RADIUS_KM = getattr(config, 'PULSE_BASE_RADIUS_KM', 0.5)
+    PULSE_MAG_SCALE = getattr(config, 'PULSE_MAG_SCALE', 0.5)
+    PULSE_MAX_RADIUS_KM = getattr(config, 'PULSE_MAX_RADIUS_KM', 2.0)
 except Exception:
     SPS = 20000; BG = "#0a0a0a"; LC = "#00ff64"; PC = "#ff3232"
     LW = 1.0; PS = 6; DS = 1; SENS = 0.1; SR = 400
+    PULSE_USE_MAGNITUDE = False
+    PULSE_BASE_RADIUS_KM = 0.5
+    PULSE_MAG_SCALE = 0.5
+    PULSE_MAX_RADIUS_KM = 2.0
 
 logger = logging.getLogger('seismic')
 
 POS_FILE = "station_position.json"
 
+
 class SeismicEvent:
     def __init__(self, data):
-        self.magnitude = data['magnitude']
-        self.ml_magnitude = data.get('ml_magnitude', 0.0)
+        self.magnitude = data.get('magnitude', 0.0) or 0.0
+        self.ml_magnitude = data.get('ml_magnitude', None)
+        if self.ml_magnitude is None:
+            self.ml_magnitude = float('nan')
         self.peak_amp = data.get('peak_amplitude', self.magnitude)
         self.azimuth = data['azimuth']
         self.distance = data.get('distance', 50)
@@ -47,23 +69,40 @@ class SeismicEvent:
         self.is_p = data.get('is_p', False)
         self.is_s = data.get('is_s', False)
         self.p_s_delta = data.get('p_s_delta', None)
+
     def get_opacity(self):
         age = time.time() - self.birth_time
-        if age > FADE_OUT_SECONDS: return 0.0
+        if age > FADE_OUT_SECONDS:
+            return 0.0
         return 1.0 - (age / FADE_OUT_SECONDS)
-    def is_visible(self): return self.get_opacity() > 0.01
+
+    def is_visible(self):
+        return self.get_opacity() > 0.01
+
     def get_pulse_radius(self, pulse_index=0):
+        """v9.6.x: конфигурируемый радиус пульса."""
         age = time.time() - self.birth_time
         adjusted_age = age - (pulse_index * 0.3)
-        if adjusted_age < 0 or adjusted_age > PULSE_FADE_SECONDS: return None
-        mag_mv = self.magnitude * 1
-        base_radius = mag_mv * 0.005
+        if adjusted_age < 0 or adjusted_age > PULSE_FADE_SECONDS:
+            return None
+        if PULSE_USE_MAGNITUDE and not np.isnan(self.ml_magnitude):
+            base_radius = self.ml_magnitude * PULSE_MAG_SCALE
+        else:
+            base_radius = PULSE_BASE_RADIUS_KM
         expansion = adjusted_age * 0.2
-        return min(base_radius + expansion, 2.0)
+        return min(base_radius + expansion, PULSE_MAX_RADIUS_KM)
+
+    def clone(self):
+        """v9.6.x: независимая копия события (без мутации)."""
+        new = SeismicEvent.__new__(SeismicEvent)
+        new.__dict__.update(self.__dict__)
+        return new
+
 
 class MapWidget(QWidget):
     stationMoved = pyqtSignal(float, float)
     mapScaled = pyqtSignal(float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.events = []
@@ -72,26 +111,22 @@ class MapWidget(QWidget):
         self.anim_timer = QTimer()
         self.anim_timer.timeout.connect(self.update)
         self.anim_timer.start(config.MAP_UPDATE_MS)
-        
-        # Дефолты для масштаба
+
         self._pixel_scale = 1.0
         self.map_scale = MAP_SCALE_KM_PER_PIXEL
-        
-        # Инициализация ПЕРЕД загрузкой карты
+
         self.map_pixmap = None
         self.map_offset_x = 0
         self.map_offset_y = 0
-        
-        # Сначала авто-масштаб (карта загружается здесь)
+
         self._load_map()
-        
-        # Потом перезапись из JSON (если есть сохраненный pixel_scale)
+
         pos = self._load_position()
         self.station_offset_x = pos.get('station_offset_x', globals().get('STATION_OFFSET_X', 0))
         self.station_offset_y = pos.get('station_offset_y', globals().get('STATION_OFFSET_Y', 0))
         self.map_offset_x = pos.get('map_offset_x', 0)
         self.map_offset_y = pos.get('map_offset_y', 0)
-        
+
         self.dragging = False
         self.dragging_map = False
         self.drag_start = None
@@ -100,7 +135,7 @@ class MapWidget(QWidget):
         self._map_visible = True
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
-        
+
     def _load_position(self):
         self._pixel_scale = 1.0
         try:
@@ -121,6 +156,7 @@ class MapWidget(QWidget):
         except Exception as e:
             logger.warning(f"[MAP] Ошибка чтения {POS_FILE}: {e}")
         return {}
+
     def _save_position(self):
         try:
             with open(POS_FILE, 'w', encoding='utf-8') as f:
@@ -133,6 +169,7 @@ class MapWidget(QWidget):
                 }, f, indent=2)
         except Exception as e:
             logger.error(f"[MAP] Ошибка записи {POS_FILE}: {e}")
+
     def _load_map(self):
         try:
             self.map_pixmap = QPixmap(MAP_IMAGE_FILE)
@@ -154,6 +191,7 @@ class MapWidget(QWidget):
         except Exception as e:
             logger.warning(f"[MAP] Ошибка загрузки карты: {e}")
             self.map_pixmap = None
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             cx = self.width() // 2 + self.station_offset_x
@@ -168,6 +206,7 @@ class MapWidget(QWidget):
                 self.map_start = (self.map_offset_x, self.map_offset_y)
         elif event.button() == Qt.RightButton:
             self.reset_station_position()
+
     def mouseMoveEvent(self, event):
         if self.dragging:
             dx = event.x() - self.drag_start.x(); dy = event.y() - self.drag_start.y()
@@ -179,6 +218,7 @@ class MapWidget(QWidget):
             self.map_offset_x = self.map_start[0] + dx
             self.map_offset_y = self.map_start[1] + dy
             self.update()
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             if self.dragging:
@@ -186,16 +226,15 @@ class MapWidget(QWidget):
                 self._save_position(); self.stationMoved.emit(self.station_offset_x, self.station_offset_y)
             if self.dragging_map:
                 self.dragging_map = False; self._save_position()
+
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         modifiers = event.modifiers()
-        # Без Shift — точный шаг 2%
-        # С Shift — быстрый шаг 15%
         if modifiers & Qt.ShiftModifier:
             scale_factor = 1.15 if delta > 0 else 0.87
         else:
             scale_factor = 1.02 if delta > 0 else 0.98
-        
+
         self._pixel_scale *= scale_factor
         self._pixel_scale = max(MAP_MIN_SCALE, min(MAP_MAX_SCALE, self._pixel_scale))
         self.map_scale = self._pixel_scale * MAP_SCALE_KM_PER_PIXEL
@@ -256,7 +295,7 @@ class MapWidget(QWidget):
         except:
             pass
         self.update()
-		
+
     def add_event(self, data):
         peak_mv = data.get('peak_amplitude_mv', 0)
         if peak_mv < EVENT_THRESHOLD_MV:
@@ -273,38 +312,47 @@ class MapWidget(QWidget):
             self.events.sort(key=lambda e: e.birth_time, reverse=True)
             self.events = self.events[:MAX_EVENTS_ON_MAP]
         return True
+
     def _group_events_by_location(self, events):
-        if not events: return []
+        """v9.6.x: без мутации событий (clone())."""
+        if not events:
+            return []
         grouped = {}
         for evt in events:
             found_group = False
             for key in list(grouped.keys()):
                 existing_evt = grouped[key]
                 distance_diff = abs(evt.distance - existing_evt.distance)
-                if distance_diff > 3.0: continue
+                if distance_diff > 3.0:
+                    continue
                 time_diff = abs(evt.birth_time - existing_evt.birth_time)
-                if time_diff > 0.5: continue
+                if time_diff > 0.5:
+                    continue
                 azimuth_diff = abs(evt.azimuth - existing_evt.azimuth)
-                if azimuth_diff > 180: azimuth_diff = 360 - azimuth_diff
+                if azimuth_diff > 180:
+                    azimuth_diff = 360 - azimuth_diff
                 if azimuth_diff <= 15.0:
-                    if evt.magnitude > existing_evt.magnitude: new_evt = evt
-                    else: new_evt = existing_evt
+                    if evt.magnitude > existing_evt.magnitude:
+                        new_evt = evt.clone()
+                    else:
+                        new_evt = existing_evt.clone()
                     new_evt.azimuth = (evt.azimuth + existing_evt.azimuth) / 2
                     new_evt.magnitude = max(evt.magnitude, existing_evt.magnitude)
-                    grouped[key] = new_evt; found_group = True; break
+                    grouped[key] = new_evt
+                    found_group = True
+                    break
             if not found_group:
                 key = (round(evt.azimuth, 1), round(evt.distance, 1), round(evt.birth_time, 1))
                 grouped[key] = evt
         return list(grouped.values())
 
     def _draw_event_labels(self, painter, events, cx, cy, px_per_km):
-        placed_rects = []   # bounding rects уже размещённых bubble (с padding)
+        placed_rects = []
         font = QFont("Segoe UI", MAP_LABEL_FONT_SIZE, QFont.Bold)
         painter.setFont(font)
         fm = painter.fontMetrics()
         line_h = fm.height() + 2
 
-        # Сначала крупные/ближние — им приоритет в выборе места
         sorted_events = sorted(events, key=lambda e: (e.distance, -e.magnitude))
 
         for evt in sorted_events:
@@ -320,7 +368,6 @@ class MapWidget(QWidget):
             if evt.distance <= DEAD_ZONE_KM:
                 continue
 
-            # Цвет в зависимости от типа события
             if evt.event_type == 'explosion':
                 base_color = QColor(255, 200, 50)
                 type_letter = 'X'
@@ -331,26 +378,28 @@ class MapWidget(QWidget):
                 base_color = QColor(100, 180, 255)
                 type_letter = '?'
 
-            # Текст подписи
             dom_freq = ""
             if evt.spectral_features:
                 f = evt.spectral_features.get('dominant_freq', 0)
                 if f > 0:
                     dom_freq = f"@{f:.0f}Hz"
-            label1 = f"{type_letter}{evt.ml_magnitude:.2f}"
+            # v9.6.x: "M?" при NaN ml_magnitude
+            if np.isnan(evt.ml_magnitude):
+                label1 = f"{type_letter}?"
+            else:
+                label1 = f"{type_letter}{evt.ml_magnitude:.2f}"
             label2 = f"{evt.distance:.1f}км"
             if evt.p_s_delta:
                 label2 += f" Δ{evt.p_s_delta:.1f}s"
 
             tw1 = fm.horizontalAdvance(label1)
             tw2 = fm.horizontalAdvance(label2)
-            max_tw = max(tw1, tw2) + 10   # горизонтальные padding
-            total_h = line_h * 2 + 8      # вертикальные padding
+            max_tw = max(tw1, tw2) + 10
+            total_h = line_h * 2 + 8
 
             margin = 8
             tail = 8
 
-            # Все 8 кандидатов позиций bubble
             cand = {
                 'top':         QRect(ex - max_tw // 2, ey - total_h - margin - tail, max_tw, total_h),
                 'bottom':      QRect(ex - max_tw // 2, ey + margin + tail, max_tw, total_h),
@@ -362,18 +411,16 @@ class MapWidget(QWidget):
                 'bottom-right':QRect(ex + margin + tail, ey + margin + tail, max_tw, total_h),
             }
 
-            # Адаптивный порядок: предпочитаем сторону, противоположную центру карты
             order = []
-            if ex >= cx:   # событие правее станции → сначала влево
+            if ex >= cx:
                 order.extend(['left', 'top-left', 'bottom-left'])
-            else:          # левее станции → сначала вправо
+            else:
                 order.extend(['right', 'top-right', 'bottom-right'])
-            if ey >= cy:   # ниже станции → сначала вверх
+            if ey >= cy:
                 order.extend(['top', 'top-left', 'top-right'])
-            else:          # выше станции → сначала вниз
+            else:
                 order.extend(['bottom', 'bottom-left', 'bottom-right'])
 
-            # Убираем дубликаты, сохраняя приоритет
             seen = set()
             final_order = []
             for o in order:
@@ -388,12 +435,10 @@ class MapWidget(QWidget):
             best_rect = None
             for key in final_order:
                 rect = cand[key]
-                # Не вылезаем за границы виджета (отступ 4 px)
                 if rect.left() < 4 or rect.right() > self.width() - 4:
                     continue
                 if rect.top() < 4 or rect.bottom() > self.height() - 4:
                     continue
-                # Не пересекаемся с уже размещёнными (padding 4 px)
                 padded = rect.adjusted(-4, -4, 4, 4)
                 ok = True
                 for pr in placed_rects:
@@ -405,7 +450,6 @@ class MapWidget(QWidget):
                     break
 
             if best_rect is None:
-                # Fallback: хотя бы влезаем в экран, перекрытия — допустимы
                 for key in final_order:
                     rect = cand[key]
                     if (rect.left() >= 4 and rect.right() <= self.width() - 4 and
@@ -415,10 +459,8 @@ class MapWidget(QWidget):
                 if best_rect is None:
                     continue
 
-            # Сохраняем для проверки пересечений следующими событиями
             placed_rects.append(best_rect.adjusted(-4, -4, 4, 4))
 
-            # --- Рисуем speech bubble ---
             tip = QPoint(ex, ey)
             path = self._bubble_path(best_rect, tip, radius=6, tail_width=10)
 
@@ -427,17 +469,14 @@ class MapWidget(QWidget):
             border = QColor(base_color)
             border.setAlpha(int(255 * opacity))
 
-            # Заливка
             painter.setPen(Qt.NoPen)
             painter.setBrush(bg)
             painter.drawPath(path)
 
-            # Обводка
             painter.setPen(QPen(border, 1))
             painter.setBrush(Qt.NoBrush)
             painter.drawPath(path)
 
-            # Текст внутри bubble
             painter.setPen(QColor(255, 255, 255, int(255 * opacity)))
             tx = best_rect.x() + 5
             ty = best_rect.y() + line_h + 2
@@ -445,7 +484,8 @@ class MapWidget(QWidget):
             painter.drawText(tx, ty + line_h, label2)
 
     def paintEvent(self, event):
-        if not hasattr(self, 'map_scale'): return
+        if not hasattr(self, 'map_scale'):
+            return
         w, h = self.width(), self.height()
         cx = w // 2 + self.station_offset_x
         cy = h // 2 + self.station_offset_y
@@ -453,8 +493,10 @@ class MapWidget(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, False)
         painter.fillRect(0, 0, w, h, QColor(5, 5, 15))
         if self.map_pixmap and not self.map_pixmap.isNull() and getattr(self, '_map_visible', True):
-            try: base_scale = self.map_scale / globals().get('MAP_SCALE_KM_PER_PIXEL', 0.5)
-            except: base_scale = 1.0
+            try:
+                base_scale = self.map_scale / globals().get('MAP_SCALE_KM_PER_PIXEL', 0.5)
+            except:
+                base_scale = 1.0
             scaled_w = int(self.map_pixmap.width() * base_scale)
             scaled_h = int(self.map_pixmap.height() * base_scale)
             scaled_pixmap = self.map_pixmap.scaled(scaled_w, scaled_h,
@@ -485,12 +527,14 @@ class MapWidget(QWidget):
         grouped_events = self._group_events_by_location(visible_events)
         for evt in grouped_events:
             opacity = evt.get_opacity()
-            if opacity < 0.01: continue
+            if opacity < 0.01:
+                continue
             r_px = evt.distance * px_per_km
             rad = np.radians(evt.azimuth)
             ex = int(cx + r_px * np.sin(rad))
             ey = int(cy - r_px * np.cos(rad))
-            if evt.distance <= DEAD_ZONE_KM: continue
+            if evt.distance <= DEAD_ZONE_KM:
+                continue
             if evt.event_type == 'explosion':
                 pulse_color = QColor(255, 200, 50, int(opacity * 0.45 * 255))
             elif evt.event_type in ('earthquake', 'quake'):
@@ -501,7 +545,8 @@ class MapWidget(QWidget):
                 pulse_r = evt.get_pulse_radius(i)
                 if pulse_r is not None and pulse_r > 0:
                     pulse_px = pulse_r * px_per_km; pulse_px = min(pulse_px, 60.0)
-                    if pulse_px < 2: continue
+                    if pulse_px < 2:
+                        continue
                     painter.setPen(QPen(pulse_color, 1)); painter.setBrush(Qt.NoBrush)
                     painter.drawEllipse(int(ex - pulse_px), int(ey - pulse_px),
                                        int(2 * pulse_px), int(2 * pulse_px))
@@ -520,7 +565,8 @@ class MapWidget(QWidget):
         grouped_arrows = self._group_events_by_location(out_of_bounds_events)
         for evt in grouped_arrows:
             arrow_age = time.time() - evt.birth_time
-            if arrow_age > FADE_OUT_SECONDS: continue
+            if arrow_age > FADE_OUT_SECONDS:
+                continue
             progress = arrow_age / 50
             rad = np.radians(evt.azimuth)
             r_max = min(w, h) / 2 - 25
@@ -568,7 +614,12 @@ class MapWidget(QWidget):
                 painter.setBrush(QColor(0, 0, 0, int(200 * arrow_opacity)))
                 painter.setFont(QFont("Segoe UI", MAP_LABEL_FONT_SIZE, QFont.Light))
                 fm = painter.fontMetrics()
-                lbl1 = f"{type_letter}{evt.magnitude:.2f}"; lbl2 = f"{evt.distance:.1f}км"
+                # v9.6.x: "M?" при NaN ml_magnitude
+                if np.isnan(evt.ml_magnitude):
+                    lbl1 = f"{type_letter}?"
+                else:
+                    lbl1 = f"{type_letter}{evt.ml_magnitude:.2f}"
+                lbl2 = f"{evt.distance:.1f}км"
                 tw = max(fm.horizontalAdvance(lbl1), fm.horizontalAdvance(lbl2)) + 6
                 painter.drawRect(int(text_x - 2), int(text_y - 14), int(tw), 28)
                 painter.setPen(QColor(255, 255, 255, arrow_alpha))
@@ -589,22 +640,21 @@ class MapWidget(QWidget):
         dy = tip.y() - cy
         tw = tail_width
 
-        # Определяем, с какой стороны rect рисовать хвостик
         if abs(dx) > abs(dy):
-            if dx > 0:   # хвостик справа
+            if dx > 0:
                 my = rect.center().y()
                 p1 = QPoint(rect.right(), my - tw // 2)
                 p2 = QPoint(rect.right(), my + tw // 2)
-            else:        # хвостик слева
+            else:
                 my = rect.center().y()
                 p1 = QPoint(rect.left(), my + tw // 2)
                 p2 = QPoint(rect.left(), my - tw // 2)
         else:
-            if dy > 0:   # хвостик снизу
+            if dy > 0:
                 mx = rect.center().x()
                 p1 = QPoint(mx + tw // 2, rect.bottom())
                 p2 = QPoint(mx - tw // 2, rect.bottom())
-            else:        # хвостик сверху
+            else:
                 mx = rect.center().x()
                 p1 = QPoint(mx - tw // 2, rect.top())
                 p2 = QPoint(mx + tw // 2, rect.top())
@@ -613,7 +663,8 @@ class MapWidget(QWidget):
         path.lineTo(p1.x(), p1.y())
         path.lineTo(p2.x(), p2.y())
         path.closeSubpath()
-        return path		
+        return path
+
 
 class OscilloscopeWidget(pg.PlotWidget):
     def __init__(self, title="Channel"):
@@ -624,7 +675,6 @@ class OscilloscopeWidget(pg.PlotWidget):
         self.plotItem.setMouseEnabled(False, False)
         self.plotItem.setMenuEnabled(False)
         self.plotItem.hideButtons(); self.plotItem.hideAxis('left'); self.plotItem.hideAxis('bottom')
-        # v9.5.8: фиксированное окно, авто отключено в _refresh_dual
         self.raw_data = deque(maxlen=SPS)
         self.plot_data = pg.PlotDataItem(pen=pg.mkPen(LC, width=LW), downsample=DS, clipToView=True)
         self.plotItem.addItem(self.plot_data)
@@ -643,15 +693,21 @@ class OscilloscopeWidget(pg.PlotWidget):
         self.s_markers = pg.ScatterPlotItem(symbol='d', size=10,
             brush=pg.mkBrush('#ff3232'), pen=pg.mkPen(color='#4d0000', width=1))
         self.plotItem.addItem(self.s_markers)
-        self.p_marker_times = []; self.s_marker_times = []; self._last_ymax = SENS
+        # v9.6.x: _last_ymax удалён
+        self.p_marker_times = []; self.s_marker_times = []
         self._refresh_timer = QTimer()
         self._refresh_timer.timeout.connect(self._refresh)
         self._refresh_timer.start(config.REFRESH_TIMER_MS)
+
     def add_point(self, value):
-        if self.mode != 'single': return
-        try: self.raw_data.append(float(value))
-        except (ValueError, TypeError): return
+        if self.mode != 'single':
+            return
+        try:
+            self.raw_data.append(float(value))
+        except (ValueError, TypeError):
+            return
         self._dirty = True
+
     def set_data(self, data_list):
         if not data_list:
             if self.mode == 'single':
@@ -670,18 +726,17 @@ class OscilloscopeWidget(pg.PlotWidget):
                 self.curve_p.setVisible(True); self.curve_z.setVisible(True)
                 self.raw_data.clear()
             self.dual_t.clear(); self.dual_p.clear(); self.dual_z.clear()
-            self.p_marker_times.clear(); self.s_marker_times.clear(); self._last_ymax = SENS
+            self.p_marker_times.clear(); self.s_marker_times.clear()
             for item in data_list:
                 if len(item) >= 4:
                     try:
                         t = float(item[0]); x = float(item[1]); y = float(item[2]); z = float(item[3])
-                        # v9.3.3: используем предвычисленный p_amp если есть
                         if len(item) >= 5:
                             self.dual_t.append(t); self.dual_p.append(float(item[4])); self.dual_z.append(z)
                         else:
                             self.dual_t.append(t); self.dual_p.append(np.sqrt(x*x + y*y)); self.dual_z.append(z)
-                    except (ValueError, TypeError): continue
-#           self.plotItem.setYRange(-SENS * 2.5, SENS * 2.5, padding=0)
+                    except (ValueError, TypeError):
+                        continue
             self.plotItem.setXRange(0, SPS, padding=0)
             self._dirty = True; self._refresh()
         else:
@@ -693,9 +748,12 @@ class OscilloscopeWidget(pg.PlotWidget):
             self.raw_data.clear()
             for val in data_list:
                 if not np.isnan(val) and not np.isinf(val):
-                    try: self.raw_data.append(float(val))
-                    except (ValueError, TypeError): continue
+                    try:
+                        self.raw_data.append(float(val))
+                    except (ValueError, TypeError):
+                        continue
             self._dirty = True; self._refresh()
+
     def update_data(self, t, x, y, z):
         if self.mode != 'dual':
             self.mode = 'dual'
@@ -705,30 +763,42 @@ class OscilloscopeWidget(pg.PlotWidget):
         p_amp = np.sqrt(float(x)**2 + float(y)**2); z_amp = float(z)
         self.dual_t.append(float(t)); self.dual_p.append(p_amp); self.dual_z.append(z_amp)
         self._dirty = True
+
     def add_p_marker(self, t):
         self.p_marker_times.append(float(t)); self._cleanup_markers(float(t))
+
     def add_s_marker(self, t):
         self.s_marker_times.append(float(t)); self._cleanup_markers(float(t))
+
     def _cleanup_markers(self, current_t):
         cutoff = current_t - (SPS / SR) - 5.0
         self.p_marker_times = [tm for tm in self.p_marker_times if tm > cutoff]
         self.s_marker_times = [tm for tm in self.s_marker_times if tm > cutoff]
+
     def _refresh(self):
-        if not getattr(self, '_dirty', False): return
+        if not getattr(self, '_dirty', False):
+            return
         self._dirty = False
-        if self.mode == 'single': self._refresh_single()
-        else: self._refresh_dual()
+        if self.mode == 'single':
+            self._refresh_single()
+        else:
+            self._refresh_dual()
+
     def _refresh_single(self):
         data = list(self.raw_data)
-        if not data: self.plot_data.setData([], []); self.scatter.setData([], []); return
+        if not data:
+            self.plot_data.setData([], []); self.scatter.setData([], []); return
         y_arr = np.array(data, dtype=np.float32)
-        if len(y_arr) > 1: y_arr -= np.mean(y_arr)
+        if len(y_arr) > 1:
+            y_arr -= np.mean(y_arr)
         x_arr = np.arange(len(y_arr), dtype=np.float32)
         self.plot_data.setData(x_arr, y_arr)
         self.scatter.setData([len(y_arr) - 1], [y_arr[-1]])
         n = len(y_arr)
-        if n < SPS: self.plotItem.setXRange(0, SPS, padding=0)
-        else: self.plotItem.setXRange(n - SPS, n, padding=0)
+        if n < SPS:
+            self.plotItem.setXRange(0, SPS, padding=0)
+        else:
+            self.plotItem.setXRange(n - SPS, n, padding=0)
         self.plotItem.setYRange(-SENS, SENS, padding=0)
 
     def _refresh_dual(self):
@@ -741,27 +811,17 @@ class OscilloscopeWidget(pg.PlotWidget):
         p_arr = np.array(self.dual_p, dtype=np.float32)
         z_arr = np.array(self.dual_z, dtype=np.float32)
 
-        ymax = SENS
-
         # === v9.5.8: УПРОЩЁННОЕ РАЗМЕЩЕНИЕ ===
-        # Два явных параметра — положение центра каждого графика (в вольтах).
-        # Меняйте их — графики двигаются внутри фиксированного окна.
-        #
-        # H-график (зелёный, горизонтальные геофоны) — вверху:
-        h_center = -0.035
-        # Z-график (синий, вертикальный геофон) — внизу:
-        z_center = -0.07
-        #
-        # Окно фиксированное (в вольтах). Должно быть шире, чем графики + центры.
-        # При SENS=0.04 (40 мВ): окно от -0.15 до +0.15 охватывает всё.
+        h_center = -0.02
+        z_center = -0.04
         y_min = -0.15
         y_max = +0.15
 
+        # v9.6.x: _last_ymax удалён
         p_display = p_arr + h_center
         z_display = z_arr + z_center
         self.curve_p.setData(x_arr, p_display)
         self.curve_z.setData(x_arr, z_display)
-        self._last_ymax = ymax
 
         vb = self.plotItem.getViewBox()
         vb.enableAutoRange(axis='y', enable=False)
@@ -775,10 +835,7 @@ class OscilloscopeWidget(pg.PlotWidget):
         t_arr = np.array(self.dual_t, dtype=np.float64)
         t_min = float(t_arr[0]); t_max = float(t_arr[-1])
 
-        # === МАРКЕРЫ P/S: рисуются на СВОИХ графиках ===
-        # P (зелёный треугольник ▲) — на Z-графике
-        # S (красный ромб ◆) — на H-графике
-        marker_pad = ymax * 0.1
+        marker_pad = SENS * 0.1
         y_p = z_center + marker_pad
         y_s = h_center + marker_pad
 
@@ -801,6 +858,7 @@ class OscilloscopeWidget(pg.PlotWidget):
         else:
             self.s_markers.setData([], [])
 
+
 class WaterAlarmWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -809,15 +867,22 @@ class WaterAlarmWidget(QWidget):
         self.blink_timer = QTimer()
         self.blink_timer.timeout.connect(self._blink)
         self.blink_timer.start(config.BLINK_TIMER_MS)
+
     def _blink(self):
-        if self.alarm: self.blink_state = not self.blink_state; self.update()
+        if self.alarm:
+            self.blink_state = not self.blink_state; self.update()
         else:
-            if self.blink_state: self.blink_state = False; self.update()
+            if self.blink_state:
+                self.blink_state = False; self.update()
+
     def set_alarm(self, alarm: bool, voltage: float):
         self.alarm = bool(alarm)
-        try: self.voltage = float(voltage)
-        except Exception: self.voltage = 0.0
+        try:
+            self.voltage = float(voltage)
+        except Exception:
+            self.voltage = 0.0
         self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self); painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()

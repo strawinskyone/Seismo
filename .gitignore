@@ -1,6 +1,9 @@
 venv/
 True/
+snapshots/
+archive/
 __pycache__/
+
 *.pyc
 *.png
 *.log

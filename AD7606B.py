@@ -78,7 +78,7 @@ class AD7606B:
     def _choose_oversampling(self, sample_rate):
         if sample_rate <= 100: return 0x08   # 256×
         if sample_rate <= 200: return 0x07   # 128×
-        if sample_rate <= 400: return 0x08   # 64×  ← или 0x08, если CPU тянет
+        if sample_rate <= 400: return 0x07   # 64×  ← или 0x08, если CPU тянет
         if sample_rate <= 600: return 0x04   # 16×
         return 0x02                          # 4×
 

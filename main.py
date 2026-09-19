@@ -5,7 +5,7 @@ from logging.handlers import RotatingFileHandler
 from multiprocessing import Process, Queue, Event
 from PyQt5.QtWidgets import QApplication, QMainWindow, QHBoxLayout, QVBoxLayout, QWidget
 from PyQt5.QtCore import QTimer, Qt
-from test_events import inject_test_events
+#from test_events import inject_test_events
 import config
 from config import *
 from acquisition_process import DataAcquisitionProcess
@@ -165,16 +165,16 @@ class SeismicMonitor(QMainWindow):
             logger.warning("[MAIN] Heavy worker terminated forcefully")
         event.accept()
 
-    def keyPressEvent(self, event):
+#   def keyPressEvent(self, event):
         # Горячие клавиши главного окна.
-        key = event.key()
-        if key == Qt.Key_J:
-            inject_test_events(self.map, self.scopes)
-            self.setWindowTitle(
-                f"Сейсмостанция {config.VERSION} | ТЕСТ: события на карте | ±{GRAPH_SENSITIVITY_MV}mV"
-            )
-        else:
-            super().keyPressEvent(event)
+#        key = event.key()
+#        if key == Qt.Key_J:
+#            inject_test_events(self.map, self.scopes)
+#            self.setWindowTitle(
+#                f"Сейсмостанция {config.VERSION} | ТЕСТ: события на карте | ±{GRAPH_SENSITIVITY_MV}mV"
+#            )
+#        else:
+#            super().keyPressEvent(event)
 
 if __name__ == "__main__":
     try: import obspy, scipy, numpy, PyQt5, pyqtgraph

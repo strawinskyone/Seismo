@@ -3,337 +3,253 @@
 # Полный конфигурационный файл сейсмостанции.
 # ВСЕ значения задаются здесь. Нигде в коде нет "магических чисел".
 # РАЗДЕЛЫ СГРУППИРОВАНЫ ПО СМЫСЛУ.
+#
+# v9.6.x: часть констант вычисляется автоматически в разделе
+# «ВЫЧИСЛЯЕМЫЕ КОНСТАНТЫ». Меняйте только БАЗОВЫЕ параметры
+# (секунды, Гц, мВ, км, В) — производные пересчитаются сами.
 
 import logging
 from logging.handlers import RotatingFileHandler
 
 # ==================== ОБЩИЕ / СИСТЕМА ====================
-VERSION = "v9.5.3"
+VERSION = "v9.6.0"
 SAMPLE_RATE = 400                     # Гц. Допустимые: 100, 200, 300, 400, 600.
-                                      # 400 Гц — оптимум для локальной сейсмики
-                                      # (взрывы, удары, близкие землетрясения).
-                                      # Выше 600 Гц — перегрузка CPU на Raspberry Pi.
+                                      # 400 Гц — оптимум для локальной сейсмики.
+                                      # ВАЖНО: с OSR 128x (0x07) реальная частота = 400.03 Гц,
+                                      # проверено 2026-09-18. С OSR 256x — падала до 327 Гц.
 
 # === CPU AFFINITY (Raspberry Pi 4: ядра 0-3) ===
-# Привязка потоков к ядрам для изоляции от планировщика Linux.
-# Требует root (sudo). Пустое множество = авто.
-# Рекомендация: DAQ на одном ядре с изоляцией (isolcpus в cmdline.txt),
-# GUI на отдельном, heavy worker на третьем.
-DAQ_CPU_CORES = {3}                   # ядро для сбора данных (ADC + pigpio).
-                                      # Ядро 3 часто свободно от системных задач.
-GUI_CPU_CORES = {1}                   # ядро для GUI (PyQt5 + pyqtgraph).
-                                      # PyQt5 event loop не любит миграции между ядрами.
-HEAVY_PROCESS_CPU_CORES = {2}         # ядро для STA/LTA, Welch, FFT в отдельном процессе.
-                                      # Обработка тяжёлая, но редкая — одного ядра достаточно.
+DAQ_CPU_CORES = {3}
+GUI_CPU_CORES = {1}
+HEAVY_PROCESS_CPU_CORES = {2}
 
 # === ПРОЦЕССОР ===
 HEAVY_PROCESS_INTERVAL_SEC = 0.35     # интервал тяжёлой обработки, сек.
-                                      # STA/LTA, refinement P-времени, flush трекеров.
-                                      # Меньше 0.1 с — перегрузка CPU. Больше 0.5 с —
-                                      # задержка между P_END и отправкой snapshot.
 
 # === ADC (AD7606B) ===
-# ±2.5V на 16-bit signed = 32768 LSB (two's complement).
-# 1 LSB = 2.5 / 32768 = 76.2939 мкВ.
-# Этот масштаб используется для перевода raw LSB → вольты везде в коде.
-ADC_SCALE_V = 2.5 / 32768.0
+ADC_SCALE_V = 2.5 / 32768.0           # 1 LSB = 76.29 мкВ при ±2.5 В
 
 # ==================== СТАРТ / ПРОГРЕВ ====================
-ADC_WARMUP_SEC = 3.0                   # Игнорировать данные первые N секунд после старта АЦП.
-                                       # Убирает ложные onset'ы на переходном процессе.
+ADC_WARMUP_SEC = 3.0
 
 # === ДАТЧИК ВОДЫ ===
-WATER_ALARM_THRESHOLD_V = 1.5         # V. Выше этого напряжения = сработка "потоп".
-                                      # Датчик подключён на CH4 (4-й канал АЦП).
-                                      # При сухом состоянии обычно 0.0–0.3 В.
+WATER_ALARM_THRESHOLD_V = 1.5
 
 # ==================== SNAPSHOT / QUEUE ====================
-# Окно snapshot вокруг P-волны для передачи в heavy worker.
-# Pre-P должно покрывать LTA-окно (4 с) + запас.
-# Post-P должно покрывать MAX_P_S_TIME (10 с) + S-STA окно + запас.
-SNAPSHOT_PRE_P_SEC = 5.0              # секунд до P в snapshot.
-                                      # Должно быть >= P_LTA_SEC + 1 с.
-SNAPSHOT_POST_P_SEC = 15.0            # секунд после P в snapshot.
-                                      # Должно быть >= MAX_P_S_TIME_SEC + 3 с (запас после S-поиска).
-QUEUE_MAXSIZE = 3                     # макс. событий в очереди multiprocessing.
-                                      # Если heavy worker не успевает — старые события
-                                      # отбрасываются (лучше потерять старое, чем
-                                      # забить очередь и зависнуть).
+SNAPSHOT_PRE_P_SEC = 5.0
+SNAPSHOT_POST_P_SEC = 15.0
+QUEUE_MAXSIZE = 3
 
 # ==================== ОСЦИЛЛОГРАФ / КАРУСЕЛЬ ====================
-# Время отображения на экране осциллографа.
-TIME_SCALE = 90                       # секунд на ВЕСЬ экран.
-                                      # При 400 SPS = 36000 отсчётов на экран.
-CAROUSEL_PANELS = 4                   # число панелей карусели.
-                                      # [1/4] — текущие данные (активная, с метками P/S).
-                                      # [2/4]–[4/4] — история (кардиограмма, без меток).
-MAP_GRAPH_RATIO = 5                   # соотношение ширины карты и карусели (stretch factor).
-                                      # 5:1 — карта занимает ~83% ширины окна.
-
-GRAPH_SENSITIVITY_MV = 40.0           # половина полного размаха Y: ±40 мВ = 80 мВ total.
-                                      # Это НЕ порог детекции, а только масштаб осциллографа.
-                                      # Для слабых сигналов можно уменьшить до 20–50 мВ.
-
-# === DOWNSAMPLING КАРУСЕЛИ (оптимизация CPU) ===
-# При 400 SPS × 90 с = 36000 точек на экран.
-# При ширине панели ~250 px — 144 точек на пиксель! Это бессмысленная нагрузка.
-# Достаточно 1–2 точки на пиксель для визуального качества.
-CAROUSEL_DOWNSAMPLE = 16              # оставляем каждую 16-ю точку (2250 вместо 36000).
-                                      # 1 = макс. детализация, высокая нагрузка CPU.
-                                      # 4 = оптимально для Raspberry Pi (~500 точек на экран).
-                                      # 8 = минимальная нагрузка, мелочь может теряться.
-
-LINE_WIDTH = 1.0                      # толщина линии на графике, пиксели.
-GRAPH_POINT_SIZE = 4                  # размер точки текущей позиции (красная точка).
-
-GRAPH_BACKGROUND_COLOR = "#0a0a0a"    # фон панели (почти чёрный).
-GRAPH_LINE_COLOR = "#00ff64"          # цвет линии H (горизонтальная) — лайм.
-GRAPH_POINT_COLOR = "#ff3232"         # цвет точки текущей позиции — красный.
+TIME_SCALE = 90
+CAROUSEL_PANELS = 4
+MAP_GRAPH_RATIO = 5
+GRAPH_SENSITIVITY_MV = 200.0
+CAROUSEL_DOWNSAMPLE = 3216
+LINE_WIDTH = 1.0
+GRAPH_POINT_SIZE = 4
+GRAPH_BACKGROUND_COLOR = "#0a0a0a"
+GRAPH_LINE_COLOR = "#00ff64"
+GRAPH_POINT_COLOR = "#ff3232"
 
 # ==================== КАРТА ====================
-MAP_IMAGE_FILE = "map_20.jpg"         # Фоновая карта. Формат: PNG или JPG.
-                                      # JPG в 3× меньше весит — рекомендуется для Pi.
-                                      # Разрешение должно быть достаточным для
-                                      # MAP_MAX_DISTANCE_KM / MAP_SCALE_KM_PER_PIXEL.
+MAP_IMAGE_FILE = "map_20.jpg"
+MAP_MAX_DISTANCE_KM = 20              # радиус основной карты (км)
+MAP_ARROW_MAX_DISTANCE_KM = 50        # максимальная дистанция для стрелок (км)
+MAP_STEP_KM = 2
+MAP_SCALE_KM_PER_PIXEL = 40.0 / 1484
+MAP_MIN_SCALE = 0.2
+MAP_MAX_SCALE = 2.0
+STATION_OFFSET_X = 0
+STATION_OFFSET_Y = 0
+FADE_OUT_SECONDS = 60
+PULSE_FADE_SECONDS = 4.0
+MAX_EVENTS_ON_MAP = 10
+DEAD_ZONE_KM = 1.0                    # мёртвая зона (км). События ближе — игнорируются.
+MAP_LABEL_FONT_SIZE = 12
+MAP_ARROW_WIDTH = 3
 
-MAP_MAX_DISTANCE_KM = 20              # макс. дистанция отображения событий, км.
-                                      # События дальше показываются стрелками на краю.
-MAP_ARROW_MAX_DISTANCE_KM = 50        # Не показывать стрелки для событий > 50 км
-MAP_STEP_KM = 2                       # шаг кругов расстояния (концентрические круги), км.
-MAP_SCALE_KM_PER_PIXEL = 40.0 / 1484  # = диаметр карты/разрешение карты=базовый масштаб карты, км/пиксель.
-                                      # Используется для auto-scale при загрузке.
-MAP_MIN_SCALE = 0.2                   # мин. масштаб (вся карта видна).
-MAP_MAX_SCALE = 2.0                   # макс. масштаб (детали крупным планом).
-
-STATION_OFFSET_X = 0                  # начальное смещение станции от центра, пиксели.
-STATION_OFFSET_Y = 0                  # отрицательные = вверх-влево.
-
-FADE_OUT_SECONDS = 60                 # время исчезновения события с карты, сек.
-PULSE_FADE_SECONDS = 4.0              # время затухания импульсных кругов (радиальные волны), сек.
-MAX_EVENTS_ON_MAP = 10                # макс. одновременных событий на карте.
-                                      # При переполнении — удаляются самые старые.
-DEAD_ZONE_KM = 1.0                    # игнорировать события ближе, км.
-                                      # Фильтрует шум от проходящих машин, шагов и т.д.
-
-MAP_LABEL_FONT_SIZE = 12              # размер шрифта подписи события (магнитуда, дистанция).
-MAP_ARROW_WIDTH = 3                   # толщина стрелки для out-of-bounds событий.
+# === ПУЛЬС СОБЫТИЯ (v9.6.x) ===
+PULSE_USE_MAGNITUDE = False
+PULSE_BASE_RADIUS_KM = 0.5
+PULSE_MAG_SCALE = 0.5
+PULSE_MAX_RADIUS_KM = 2.0
 
 # ==================== ПОРОГИ ДЕТЕКЦИИ ====================
-EVENT_THRESHOLD_MV = 25.0             # абсолютный порог начала обработки, мВ.
-                                      # Ниже этого — событие на карту не попадает.
-                                      # Адаптивный onset использует SNR относительно
-                                      # noise_floor, но этот порог — жёсткий floor.
-EVENT_DEBOUNCE_MS = 1000              # мин. интервал между событиями, мс.
-                                      # Защита от множественных срабатываний на одну волну.
+EVENT_THRESHOLD_MV = 0.5              # абсолютный порог для карты, мВ.
+EVENT_DEBOUNCE_MS = 1000
 
 # ==================== ОРИЕНТАЦИЯ ====================
-AZIMUTH_OFFSET = 0.0                  # поправка азимута, градусы.
-                                      # Добавляется к вычисленному азимуту перед выводом.
-                                      # Используется в heavy_worker.py.
+AZIMUTH_OFFSET = 0.0
 
-# ==================== OBSPY ФИЛЬТР ====================
-# Полосовой фильтр для P-волны (STA/LTA refinement и heavy worker).
-# Частоты подобраны для локальной сейсмики (взрывы, удары, близкие толчки).
-FILTER_FREQMIN = 4.0                  # нижняя граница полосы, Гц.
-                                      # Ниже 10 Гц — много культурного шума (дороги, ветер).
-FILTER_FREQMAX = 40.0                 # верхняя граница полосы, Гц.
-                                      # Выше 45 Гц — затухание в грунте, мало энергии.
+# ==================== ФИЛЬТРЫ ====================
+# Полосовой фильтр для P-волны (refinement в processor.py).
+FILTER_FREQMIN = 4.0
+FILTER_FREQMAX = 28.0
+
+# Полосовой фильтр для S-волны (S-пикер в heavy_worker.py).
+# v9.6.0: полоса S вынесена из резонансной зоны геофона (2.5-2.8 Гц).
+S_FILTER_FREQMIN = 1.5
+S_FILTER_FREQMAX = 8.0
+
+# ==================== ИНТЕГРИРОВАНИЕ СИГНАЛА ====================
+# v9.6.0: геофон в рабочей полосе (выше f0) выдаёт СКОРОСТЬ.
+# Для физически корректной амплитуды и формы S-волны — интегрируем в СМЕЩЕНИЕ.
+INTEGRATE_FOR_S = False               # True = интегрировать (скорость → смещение)
+INTEGRATE_TREND_REMOVE_SEC = 5.0      # период удаления линейного тренда при интегрировании.
 
 # ==================== STA/LTA (P-волна) ====================
-# Параметры для уточнения P-времени в heavy processor.
-# Короткое окно = мгновенная энергия, длинное = фоновый уровень.
-P_STA_SEC = 0.1                       # короткое окно P-волны, сек.
-                                      # 0.1 с при 400 SPS = 40 отсчётов.
-P_LTA_SEC = 4.0                       # длинное окно P-волны, сек.
-                                      # Должно быть >= длительности тихого фона перед событием.
-P_TRIGGER_RATIO = 1.5                 # отношение STA/LTA для триггера P (чувствительность).
-                                      # Меньше = чувствительнее, но больше ложных срабатываний.
-P_DETRIGGER_RATIO = 1.2               # отношение для сброса P (чем ниже, тем раньше сброс).
-                                      # Должно быть < P_TRIGGER_RATIO.
+P_STA_SEC = 0.1
+P_LTA_SEC = 4.0
+P_TRIGGER_RATIO = 1.5
+P_DETRIGGER_RATIO = 1.05
+
+# === P-ДЕТЕКЦИЯ: АБСОЛЮТНЫЕ ПОРОГИ (v9.6.0) ===
+# v9.6.0: детекция работает В ВОЛЬТАХ, не в SNR. Все пороги — абсолютные.
+# Это устраняет проблему «заморозки RMS» и несогласованности порогов.
+P_DETECT_ABS_MIN_V = 0.05             # В. Минимальная |Z| для P-детекции.
+                                      # Отсекает фоновый шум (RMS ~4 мВ).
+P_DETECT_ABS_MIN_D = 0.02             # В. Минимальная производная |Z[i]-Z[i-N]| за 10 мс.
+                                      # Отсекает медленные дрейфы и одиночные спайки.
+P_DETECT_DIFF_N = 4                   # окно производной в отсчётах (10 мс при 400 SPS).
+
+# === P_END: ОТНОСИТЕЛЬНЫЙ ПОРОГ (v9.6.0) ===
+# Абсолютный порог P_END_ABS_V вычисляется ниже из P_DETECT_ABS_MIN_V.
+P_END_REL_BASE = 0.30                 # базовая доля от пика (30%).
+P_END_REL_SNR_FACTOR = 0.20           # коррекция по SNR (legacy, не используется).
 
 # ==================== STA/LTA (S-волна) ====================
-# Параметры для поиска S-волны в heavy worker (на горизонтальных H = N,E).
-S_STA_SEC = 0.5                       # короткое окно S-волны, сек.
-                                      # S-волна длиннее P — короткое окно больше.
-S_LTA_SEC = 8.0                       # длинное окно S-волны, сек.
-S_TRIGGER_RATIO = 4.5                 # отношение для триггера S.
-                                      # S-волна сильнее P — порог выше.
-S_DETRIGGER_RATIO = 1.0               # отношение для сброса S.
-                                      # 1.0 = сброс при возврате к фону (жёсткий).
+S_STA_SEC = 0.5
+S_LTA_SEC = 8.0
+S_TRIGGER_RATIO = 4.5
+S_DETRIGGER_RATIO = 1.0
 
 # ==================== ВРЕМЕННЫЕ ОКНА P-S ====================
-MIN_P_S_TIME_SEC = 1.5                # мин. P-S время, сек.
-                                      # Меньше — физически невозможно (S не успевает отстать).
-MAX_P_S_TIME_SEC = 10.0               # макс. P-S время, сек.
-                                      # Больше — событие слишком далеко для локальной модели.
+# MIN_P_S_TIME_SEC и MAX_P_S_TIME_SEC вычисляются автоматически
+# (в разделе «ВЫЧИСЛЯЕМЫЕ КОНСТАНТЫ») из DEAD_ZONE_KM, MAP_ARROW_MAX_DISTANCE_KM
+# и VP_VS_FACTOR (зависит от VP и VS).
+
+# v9.6.0: S-поиск стартует сразу после P + короткая задержка,
+# а не после p_end + 0.5 с (p_end часто затягивается).
+S_SEARCH_START_AFTER_P_SEC = 0.2      # старт S-поиска через 0.2 с после p_idx.
+S_SEARCH_POST_P_END_SEC = 0.5         # legacy, оставлен для совместимости.
 
 # ==================== СКОРОСТИ ВОЛН ====================
-# Используются для расчёта дистанции по формуле:
-# distance = p_s_delta * VP * VS / (VP - VS)
-# Значения для среднего грунта (сухой песок/грунт).
-VP = 5.8                              # P-волна, км/с.
+VP = 5.8                              # P-волна, км/с. Влияет на VP_VS_FACTOR.
 VS = 3.3                              # S-волна, км/с.
-                                      # VP/VS ≈ 1.72 — типично для осадочных пород.
 
 # ==================== МОДЕЛЬ ГЛУБИНЫ ====================
-# Простая эмпирическая модель:
-# depth = max(0, distance * DEPTH_FACTOR - DEPTH_OFFSET)
-# Для локальных взрывов/ударов глубина часто мала или 0.
-DEPTH_FACTOR = 0.05                    # доля дистанции, идущая в глубину.
-DEPTH_OFFSET = 0.0                     # смещение, км.
+DEPTH_FACTOR = 0.05
+DEPTH_OFFSET = 0.0
 
 # ==================== ХАРАКТЕРИСТИКИ ДАТЧИКА ====================
-GEOPHONE_SENSITIVITY = 29.2           # В/(м/с). Коэффициент преобразования геофона.
-                                      # Используется для перевода амплитуды (В) → скорость грунта (м/с).
-                                      # Затем скорость → магнитуду ML.
+GEOPHONE_SENSITIVITY = 29.2
+GEOPHONE_SENSITIVITY_N = 28.48
+GEOPHONE_SENSITIVITY_E = 29.07
+GEOPHONE_SENSITIVITY_Z = 32.13
+
+GAIN_CORRECTION_N = 1.0
+GAIN_CORRECTION_E = 1.0
+GAIN_CORRECTION_Z = 1.0
+
+# === АЗИМУТ: ВЗВЕШИВАНИЕ КАНАЛОВ (v9.6.0) ===
+AZIMUTH_WEIGHT_BY_RMS = True          # True = взвешивать N и E по 1/RMS
+AZIMUTH_WIN_SEC = 0.5                 # окно PCA для азимута, сек.
 
 # ==================== FFT / WELCH ====================
-# Параметры спектрального анализа в heavy worker.
-# Welch — усреднение по периодограммам для снижения дисперсии.
-FFT_NPERSEG = 512                     # длина окна Welch, отсчётов.
-                                      # При 400 SPS = 1.28 с окна, разрешение ~0.78 Гц.
-                                      # Достаточно для классификации взрыв/толчок.
-FFT_NOVERLAP = 256                    # перекрытие окон, отсчётов.
-                                      # 50% — стандартный компромисс.
-FFT_WINDOW = 'hann'                   # тип оконной функции.
+FFT_NPERSEG = 512
+FFT_NOVERLAP = 256
+FFT_WINDOW = 'hann'
 
-# === ТИП ОКНА WELCH ===
-# Доступные опции scipy.signal.welch:
-#   'hann'     — Ханна (по умолчанию). Хорошее разрешение по частоте,
-#                боковые лепестки -31 дБ. Оптимально для общего анализа.
-#   'hamming'  — Хэмминга. Боковые лепестки -42 дБ (лучше подавление шума),
-#                но хуже разрешение. Хорошо для сейсмики с сильным шумом.
-#   'blackman' — Блэкмана. Боковые лепестки -58 дБ (лучшее подавление),
-#                но самое широкое главное лобовое плечо. Для чистых сигналов.
-#   'bartlett' — Бартлетта. Треугольное окно. Проще, хуже подавление.
-#   'flattop'  — Flat Top. Идеально для точной амплитудной калибровки,
-#                но плохое разрешение по частоте.
-#   'tukey'    — Тьюки (cosine-tapered). Гибрид: контролируемое затухание краёв.
-#   'parzen'   — Парзена. Хорошее разрешение, низкие боковые лепестки.
-#
-# РЕКОМЕНДАЦИИ для вашей установки:
-#   Шумная среда + нужно различать взрывы/землетрясения → 'hamming'
-#   Чистый сигнал + нужно точное разрешение частоты → 'blackman'
-#   Универсальный вариант → 'hann'
-
-EXPLOSION_SPECTRAL_THRESHOLD = 2.0    # порог ratio high/low power для взрыва.
-EXPLOSION_DOMINANT_FREQ_MIN = 6.0     # мин. доминирующая частота взрыва, Гц.
-                                      # Взрывы обычно имеют высокочастотный спектр.
+EXPLOSION_SPECTRAL_THRESHOLD = 2.0
+EXPLOSION_DOMINANT_FREQ_MIN = 6.0
 
 # ==================== HEAVY WORKER S-PICKER ====================
-# Параметры STA/LTA для поиска S-волны на горизонтальных компонентах.
-S_PICKER_STA_SEC = 0.3                # STA для S-пикера, сек.
-S_PICKER_LTA_SEC = 3.0                # LTA для S-пикера, сек.
-S_PICKER_TRIGGER = 4.0                # trigger ratio для S.
-                                      # Должен быть > detrigger (как у P).
-                                      # 4.0 — надёжный захват S на горизонталях.
-S_PICKER_DETRIGGER = 1.0              # detrigger ratio для S.
-                                      # 1.0 = сброс при возврате к фону.
+S_PICKER_STA_SEC = 0.5
+S_PICKER_LTA_SEC = 2.0
+S_PICKER_TRIGGER = 1.3                # v9.6.0: снижено с 4.0 — S на смещении слабее.
+S_PICKER_DETRIGGER = 0.8
+S_USE_RMS_WEIGHTING = False           # v9.6.x: отключено (тест).
 
-# ==================== АРХИВ (РЕЗЕРВ — не используется в v9.3.2) ====================
+# ==================== АРХИВ ====================
 ARCHIVE_FOLDER = "archive"
 
 # ==================== ТАЙМИНГИ ИНТЕРФЕЙСА ====================
-MAP_UPDATE_MS = 500                   # период обновления карты, мс.
-RESULT_TIMER_MS = 200                 # период проверки результатов heavy worker, мс.
-JOIN_TIMEOUT_SEC = 3.0                # таймаут ожидания heavy worker при выходе, с.
-REFRESH_TIMER_MS = 300                # период перерисовки осциллографа, мс.
-BLINK_TIMER_MS = 500                  # период мигания датчика воды, мс.
+MAP_UPDATE_MS = 1000
+RESULT_TIMER_MS = 200
+JOIN_TIMEOUT_SEC = 3.0
+REFRESH_TIMER_MS = 500
+BLINK_TIMER_MS = 500
 
 # ==================== DAQ ПАРАМЕТРЫ ====================
-DAQ_QUEUE_MAXSIZE = 200               # макс. размер очереди DAQ→GUI (батчей).
-                                      # 50 батчей × 20 сэмплов ≈ 2.5 сек буфера при 200 SPS.
-
-BATCH_SIZE = 40                       # размер батча для передачи данных GUI.
-                                      # Меньше — меньше задержка, больше накладных расходов.
-                                      # Больше — эффективнее, но GUI обновляется реже.
+DAQ_QUEUE_MAXSIZE = 200
+BATCH_SIZE = 40
 
 # ==================== ADAPTIVE ENVELOPE ====================
-# Все пороги вычисляются адаптивно по истории огибающей.
-# Ниже — только стартовые коэффициенты, не абсолютные пороги.
+ENVELOPE_WIN_SEC = 0.15
+NOISE_ESTIMATE_SEC = 10.0
+NOISE_PERCENTILE = 50.0
+SNR_THRESHOLD = 2.0                   # legacy, не используется в v9.6.0
+ONSET_DERIVATIVE_FACTOR = 5.0         # legacy, заменено на P_DETECT_ABS_MIN_D
+ONSET_GUARD_SEC = 0.5
+MAX_TRACKERS = 3
 
-ENVELOPE_WIN_SEC = 0.15               # окно peak-hold огибающей, сек.
-                                      # 0.15 с при 400 SPS = 60 отсчётов.
-                                      # Меньше — быстрее реакция, но шумнее.
-                                      # Больше — плавнее, но запаздывает.
-NOISE_ESTIMATE_SEC = 10.0             # длина истории для оценки шума, сек.
-                                      # 10 с = 4000 точек при 400 SPS.
-                                      # Должно быть >> длительности типичного события.
-NOISE_PERCENTILE = 50.0               # перцентиль для noise_floor (медиана = 50%).
-                                      # 50% — робастная оценка фона.
-                                      # Меньше — чувствительнее к тихим событиям.
-SNR_THRESHOLD = 2.0                   # env > noise_floor * SNR для onset.
-                                      # Меньше — чувствительнее, но больше ложных.
-ONSET_DERIVATIVE_FACTOR = 5.0         # множитель MAD для порога производной.
-                                      # Производная огибающей должна превысить
-                                      # median + factor * MAD.
-ONSET_GUARD_SEC = 0.5                 # guard zone между onset'ами, сек.
-                                      # Защита от дублирования трекеров на одном всплеске.
-MAX_TRACKERS = 3                      # макс. одновременных трекеров.
-                                      # При переполнении — удаляется самый старый P_ENDED.
-
-P_MIN_DURATION_SEC = 0.3              # мин. длительность P перед переходом в PEAKED.
-                                      # Защита от спайков: короткий всплеск не считается P.
-P_MAX_DURATION_SEC = 5.0              # жёсткий таймаут P, сек.
-                                      # Если P не закончилась сама — принудительный P_END.
-P_END_ABS_FACTOR = 1.5                # abs_thr = noise_floor * factor.
-                                      # Абсолютный порог окончания P.
-P_END_REL_BASE = 0.30                 # базовый относительный порог (30% пика).
-                                      # P заканчивается, когда амплитуда упала до 30% пика.
-P_END_REL_SNR_FACTOR = 0.20           # коррекция rel_thr по SNR.
-                                      # Для сильных сигналов (высокий SNR) порог снижается,
-                                      # чтобы не затягивать P.
-
-NOISE_UPDATE_INTERVAL_SEC = 5.0       # интервал обновления статистики шума, сек.
-S_SEARCH_POST_P_END_SEC = 0.5         # запас после p_end_idx перед поиском S, сек.
-                                      # S не ищется сразу после P — ждём затухания P-звена.
+P_MIN_DURATION_SEC = 0.3
+P_MAX_DURATION_SEC = 5.0
+NOISE_UPDATE_INTERVAL_SEC = 5.0
+PROC_DIAG_INTERVAL_SEC = 5.0          # v9.6.x: интервал диагностики processor, сек.
+                                      # 0 = отключено. 5 = отладка. 30+ = продакшн.
 
 
 # ============================================================================
 # ==================== ВЫЧИСЛЯЕМЫЕ КОНСТАНТЫ (НЕ РЕДАКТИРОВАТЬ) ==============
 # ============================================================================
 # Все значения ниже вычисляются автоматически из базовых параметров выше.
-# При изменении SAMPLE_RATE или временных окон они пересчитаются сами.
-# Редактировать только базовые параметры (секунды, Гц, мВ, км)!
+# При изменении базовых (секунды, Гц, км, В) — пересчитываются сами.
+
+# --- Физические константы из VP/VS ---
+# Коэффициент перевода P-S времени в дистанцию: distance = ΔP-S · VP_VS_FACTOR
+VP_VS_FACTOR = (VP * VS) / (VP - VS)   # = 7.656 при VP=5.8, VS=3.3
+
+# --- P-S временные окна (в секундах) ---
+# Привязаны к DEAD_ZONE_KM и MAP_ARROW_MAX_DISTANCE_KM через VP_VS_FACTOR.
+# Жёсткий минимум 0.2 с — ниже физически невозможно для реального S.
+MIN_P_S_TIME_SEC = max(0.2, DEAD_ZONE_KM / VP_VS_FACTOR)
+MAX_P_S_TIME_SEC = MAP_ARROW_MAX_DISTANCE_KM / VP_VS_FACTOR
+
+# --- Порог окончания P (в вольтах) ---
+# Половина от порога начала, минимум 5 мВ.
+P_END_ABS_V = max(P_DETECT_ABS_MIN_V * 0.5, 0.005)
 
 # --- Экран / визуализация ---
 SAMPLES_PER_SCREEN = int(TIME_SCALE * SAMPLE_RATE)
 
 # --- Буферы processor.py ---
-# Основной кольцевой буфер (должен вместить snapshot + запас)
 BUFFER_SIZE = int(max(80.0, SNAPSHOT_PRE_P_SEC + SNAPSHOT_POST_P_SEC + 20.0) * SAMPLE_RATE)
-
-# Окно огибающей (peak-hold)
 ENVELOPE_WIN_N = max(1, int(ENVELOPE_WIN_SEC * SAMPLE_RATE))
-
-# История шума
 NOISE_ESTIMATE_N = int(NOISE_ESTIMATE_SEC * SAMPLE_RATE)
-
-# История производной (для MAD)
 DERIV_HISTORY_N = max(100, NOISE_ESTIMATE_N)
-
-# Задержка огибающей для d_env
 ENVELOPE_DELAY_N = max(1, int(0.1 * SAMPLE_RATE))
-
-# --- Интервалы обработки ---
 HEAVY_PROCESS_INTERVAL_N = int(HEAVY_PROCESS_INTERVAL_SEC * SAMPLE_RATE)
 NOISE_UPDATE_INTERVAL_N = int(NOISE_UPDATE_INTERVAL_SEC * SAMPLE_RATE)
 
 # --- STA/LTA в сэмплах (P-уточнение в processor) ---
 P_STA_N = max(1, int(P_STA_SEC * SAMPLE_RATE))
 P_LTA_N = max(1, int(P_LTA_SEC * SAMPLE_RATE))
+P_DETECT_DIFF_N = max(1, int(P_DETECT_DIFF_N))
 
 # --- STA/LTA в сэмплах (S-пикер в heavy_worker) ---
 S_PICKER_STA_N = max(1, int(S_PICKER_STA_SEC * SAMPLE_RATE))
 S_PICKER_LTA_N = max(1, int(S_PICKER_LTA_SEC * SAMPLE_RATE))
 
-# --- Snapshot границы (для get_snapshot) ---
+# --- Snapshot границы ---
 SNAPSHOT_PRE_P_N = int(SNAPSHOT_PRE_P_SEC * SAMPLE_RATE)
 SNAPSHOT_POST_P_N = int(SNAPSHOT_POST_P_SEC * SAMPLE_RATE)
 
 # --- P-S временные окна в сэмплах ---
 MIN_P_S_TIME_N = int(MIN_P_S_TIME_SEC * SAMPLE_RATE)
 MAX_P_S_TIME_N = int(MAX_P_S_TIME_SEC * SAMPLE_RATE)
+S_SEARCH_START_AFTER_P_N = int(S_SEARCH_START_AFTER_P_SEC * SAMPLE_RATE)
 S_SEARCH_POST_P_END_N = int(S_SEARCH_POST_P_END_SEC * SAMPLE_RATE)
 
 # --- Длительности фаз ---
@@ -346,9 +262,12 @@ ADC_WARMUP_N = int(ADC_WARMUP_SEC * SAMPLE_RATE)
 EVENT_DEBOUNCE_N = int(EVENT_DEBOUNCE_MS / 1000.0 * SAMPLE_RATE)
 
 # --- heavy_worker специфичные ---
-AZIMUTH_WIN_N = max(1, int(1.0 * SAMPLE_RATE))
+AZIMUTH_WIN_N = max(1, int(AZIMUTH_WIN_SEC * SAMPLE_RATE))
 RSAM_WIN_N = max(1, int(2.0 * SAMPLE_RATE))
 MAX_P_S_SEARCH_N = int((MAX_P_S_TIME_SEC + 2.0) * SAMPLE_RATE)
+
+INTEGRATE_TREND_REMOVE_N = int(INTEGRATE_TREND_REMOVE_SEC * SAMPLE_RATE)
+
 
 
 # ============================================================================
@@ -409,6 +328,10 @@ def validate_config():
     assert FILTER_FREQMIN > 0, "FILTER_FREQMIN must be > 0"
     assert FILTER_FREQMAX <= SAMPLE_RATE / 2.0, \
         f"FILTER_FREQMAX ({FILTER_FREQMAX}) must be <= Nyquist ({SAMPLE_RATE/2.0} Гц)"
+    assert S_FILTER_FREQMIN < S_FILTER_FREQMAX, \
+        f"S_FILTER_FREQMIN ({S_FILTER_FREQMIN}) must be < S_FILTER_FREQMAX ({S_FILTER_FREQMAX})"
+    assert S_FILTER_FREQMAX <= SAMPLE_RATE / 2.0, \
+        f"S_FILTER_FREQMAX ({S_FILTER_FREQMAX}) must be <= Nyquist ({SAMPLE_RATE/2.0} Гц)"
     assert GRAPH_SENSITIVITY_MV > 0, "GRAPH_SENSITIVITY_MV must be > 0"
     assert TIME_SCALE > 0, "TIME_SCALE must be > 0"
     assert ADC_WARMUP_SEC >= 0, "ADC_WARMUP_SEC must be >= 0"
@@ -417,9 +340,15 @@ def validate_config():
         f"P_MAX_DURATION_SEC ({P_MAX_DURATION_SEC}) must be > P_MIN_DURATION_SEC ({P_MIN_DURATION_SEC})"
     assert ONSET_GUARD_SEC >= 0, "ONSET_GUARD_SEC must be >= 0"
     assert SNR_THRESHOLD > 0, "SNR_THRESHOLD must be > 0"
-    assert P_END_ABS_FACTOR > 0, "P_END_ABS_FACTOR must be > 0"
     assert 0 < P_END_REL_BASE <= 1.0, "P_END_REL_BASE must be in (0, 1.0]"
     assert P_END_REL_SNR_FACTOR >= 0, "P_END_REL_SNR_FACTOR must be >= 0"
+    assert P_DETECT_ABS_MIN_V > 0, "P_DETECT_ABS_MIN_V must be > 0"
+    assert P_DETECT_ABS_MIN_D > 0, "P_DETECT_ABS_MIN_D must be > 0"
+    assert P_DETECT_DIFF_N >= 1, "P_DETECT_DIFF_N must be >= 1"
+    assert P_END_ABS_V > 0, "P_END_ABS_V must be > 0"
+    assert S_SEARCH_START_AFTER_P_SEC >= 0, "S_SEARCH_START_AFTER_P_SEC must be >= 0"
+    assert AZIMUTH_WIN_SEC > 0, "AZIMUTH_WIN_SEC must be > 0"
+    assert INTEGRATE_TREND_REMOVE_SEC > 0, "INTEGRATE_TREND_REMOVE_SEC must be > 0"
     assert WATER_ALARM_THRESHOLD_V >= 0, "WATER_ALARM_THRESHOLD_V must be >= 0"
     assert MAP_MAX_DISTANCE_KM > 0, "MAP_MAX_DISTANCE_KM must be > 0"
     assert MAP_ARROW_MAX_DISTANCE_KM >= MAP_MAX_DISTANCE_KM, \
@@ -431,14 +360,18 @@ def validate_config():
     assert MAP_SCALE_KM_PER_PIXEL > 0, "MAP_SCALE_KM_PER_PIXEL must be > 0"
     assert CAROUSEL_PANELS >= 1, "CAROUSEL_PANELS must be >= 1"
     assert MAP_GRAPH_RATIO >= 1, "MAP_GRAPH_RATIO must be >= 1"
-
+    assert GEOPHONE_SENSITIVITY_N > 0, "GEOPHONE_SENSITIVITY_N must be > 0"
+    assert GEOPHONE_SENSITIVITY_E > 0, "GEOPHONE_SENSITIVITY_E must be > 0"
+    assert GEOPHONE_SENSITIVITY_Z > 0, "GEOPHONE_SENSITIVITY_Z must be > 0"
+    assert GAIN_CORRECTION_N > 0, "GAIN_CORRECTION_N must be > 0"
+    assert GAIN_CORRECTION_E > 0, "GAIN_CORRECTION_E must be > 0"
+    assert GAIN_CORRECTION_Z > 0, "GAIN_CORRECTION_Z must be > 0"
 
 class MaxLevelFilter(logging.Filter):
     """
     Фильтр уровня: пропускает записи с levelno <= max_level.
     Используется для разделения потоков:
     ddd_handler (DEBUG+INFO) vs err_handler (WARNING+).
-    Без этого фильтра WARNING дублировались в оба файла.
     """
     def __init__(self, max_level):
         self.max_level = max_level
@@ -456,7 +389,8 @@ def setup_logging():
     error.log — WARNING, ERROR, CRITICAL (без дублирования).
     events.log — создаётся отдельно в main.py (только события на карту).
 
-    В терминал ничего не выводится — всё идёт в файлы.
+    v9.6.x: логгер 'seismic.flush' отключён по умолчанию.
+    Для отладки flush — раскомментировать строку с setLevel(logging.DEBUG).
     """
     logger = logging.getLogger('seismic')
     if logger.handlers:
@@ -468,7 +402,6 @@ def setup_logging():
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # ddd.log — всё от DEBUG до INFO (WARNING и выше — НЕТ)
     ddd_handler = RotatingFileHandler(
         'ddd.log', maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
     )
@@ -477,12 +410,21 @@ def setup_logging():
     ddd_handler.setFormatter(formatter)
     logger.addHandler(ddd_handler)
 
-    # error.log — только WARNING и выше
     err_handler = RotatingFileHandler(
         'error.log', maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
     )
     err_handler.setLevel(logging.WARNING)
     err_handler.setFormatter(formatter)
     logger.addHandler(err_handler)
+
+    # --- v9.6.x: отдельный логгер для flush-сообщений ---
+    # По умолчанию отключён, чтобы не забивать ddd.log.
+    # Для отладки: раскомментировать setLevel(logging.DEBUG).
+    flush_logger = logging.getLogger('seismic.flush')
+    flush_logger.setLevel(logging.CRITICAL + 1)   # полностью выключен
+    # flush_logger.setLevel(logging.DEBUG)         # ← раскомментировать при отладке
+    if not flush_logger.handlers:
+        flush_logger.addHandler(ddd_handler)
+        flush_logger.propagate = False
 
     return logger
