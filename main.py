@@ -50,6 +50,9 @@ class SeismicMonitor(QMainWindow):
         self.event_count = 0; self.last_event_display = ""
         self.next_scope_id = 4; self.scope_ids = [0, 1, 2, 3]
         self.buffers = [[] for _ in range(CAROUSEL_PANELS)]
+        # v9.6.11: буферы cft для каждой панели карусели
+        self.cft_buffers = [[] for _ in range(CAROUSEL_PANELS)]
+        self.last_cft = 0.0   # последнее значение cft (для синхронизации с batch)
         print_banner(); self.init_ui()
         self.data_process.start()
         logger.info("[MAIN] DAQ process started")
@@ -63,6 +66,8 @@ class SeismicMonitor(QMainWindow):
         self.processor = SeismicProcessor(event_queue=self.event_queue,
             p_onset_callback=lambda t: self.scopes[0].add_p_marker(t))
         self.processor.scope_id_callback = lambda: self.scope_ids[0]
+        # v9.6.10: callback для cft-графика на карусели
+        self.processor.h_ratio_callback = self._on_cft_update
 
         self.data_queue = Queue(maxsize=config.DAQ_QUEUE_MAXSIZE)
         self.stop_event = Event()
@@ -108,7 +113,11 @@ class SeismicMonitor(QMainWindow):
             if len(volts) < 4: continue
             x, y, z, water = volts; t = batch_ts[i]
             p_amp = (x*x + y*y) ** 0.5
-            self.buffers[0].append((t, x, y, z, p_amp)); self.scopes[0].update_data(t, x, y, z)
+            # v9.6.11: cft 
+            self.buffers[0].append((t, x, y, z, p_amp))
+            self.cft_buffers[0].append(self.last_cft)
+            self.scopes[0].update_data(t, x, y, z)
+            self.scopes[0].update_cft(self.last_cft)
             self.counter += 1
             if self.counter >= SAMPLES_PER_SCREEN: self._rotate(); self.counter = 0
             if i == batch_len - 1: self.water_alarm.set_alarm(water > WATER_ALARM_THRESHOLD_V, water)
@@ -116,10 +125,14 @@ class SeismicMonitor(QMainWindow):
     def _rotate(self):
         for i in range(CAROUSEL_PANELS - 1, 0, -1):
             self.buffers[i] = list(self.buffers[i-1])
+            self.cft_buffers[i] = list(self.cft_buffers[i-1])   # v9.6.11
             self.scope_ids[i] = self.scope_ids[i-1]
             self.scopes[i].set_data(self.buffers[i])
-        self.buffers[0] = []; self.scope_ids[0] = self.next_scope_id; self.next_scope_id += 1
+            self.scopes[i].set_cft_data(self.cft_buffers[i])    # v9.6.11
+        self.buffers[0] = []; self.cft_buffers[0] = []
+        self.scope_ids[0] = self.next_scope_id; self.next_scope_id += 1
         self.scopes[0].set_data([])
+        self.scopes[0].set_cft_data([])
 
     def _check_results(self):
         while not self.result_queue.empty():
@@ -147,6 +160,14 @@ class SeismicMonitor(QMainWindow):
                 self.last_event_display = f"#{self.event_count} {etype} {distance:.1f}km"
                 self.setWindowTitle(f"Сейсмостанция {config.VERSION} | {self.last_event_display} | ±{GRAPH_SENSITIVITY_MV}mV")
             except Exception as e: logger.error(f"[MAIN] Error processing result: {e}"); break
+
+    def _on_cft_update(self, cft_val):
+
+        try:
+            self.last_cft = float(cft_val)
+        except (ValueError, TypeError):
+            pass
+
 
     def _update_map(self): self.map.update()
 

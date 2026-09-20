@@ -12,7 +12,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # ==================== ОБЩИЕ / СИСТЕМА ====================
-VERSION = "v9.6.0"
+VERSION = "v9.6.11"
 SAMPLE_RATE = 400                     # Гц. Допустимые: 100, 200, 300, 400, 600.
                                       # 400 Гц — оптимум для локальной сейсмики.
                                       # ВАЖНО: с OSR 128x (0x07) реальная частота = 400.03 Гц,
@@ -44,8 +44,8 @@ QUEUE_MAXSIZE = 3
 TIME_SCALE = 90
 CAROUSEL_PANELS = 4
 MAP_GRAPH_RATIO = 5
-GRAPH_SENSITIVITY_MV = 200.0
-CAROUSEL_DOWNSAMPLE = 3216
+GRAPH_SENSITIVITY_MV = 500.0
+CAROUSEL_DOWNSAMPLE = 120
 LINE_WIDTH = 1.0
 GRAPH_POINT_SIZE = 4
 GRAPH_BACKGROUND_COLOR = "#0a0a0a"
@@ -119,8 +119,8 @@ P_END_REL_BASE = 0.30                 # базовая доля от пика (3
 P_END_REL_SNR_FACTOR = 0.20           # коррекция по SNR (legacy, не используется).
 
 # ==================== STA/LTA (S-волна) ====================
-S_STA_SEC = 0.5
-S_LTA_SEC = 8.0
+S_STA_SEC = 0.25
+S_LTA_SEC = 12.0
 S_TRIGGER_RATIO = 4.5
 S_DETRIGGER_RATIO = 1.0
 
@@ -166,10 +166,12 @@ EXPLOSION_DOMINANT_FREQ_MIN = 6.0
 
 # ==================== HEAVY WORKER S-PICKER ====================
 S_PICKER_STA_SEC = 0.5
-S_PICKER_LTA_SEC = 2.0
+S_PICKER_LTA_SEC = 4.0
 S_PICKER_TRIGGER = 1.3                # v9.6.0: снижено с 4.0 — S на смещении слабее.
 S_PICKER_DETRIGGER = 0.8
-S_USE_RMS_WEIGHTING = False           # v9.6.x: отключено (тест).
+S_USE_RMS_WEIGHTING = True           # v9.6.x: отключено (тест).
+H_DISPLAY_STA_SEC = 0.15
+H_DISPLAY_LTA_SEC = 4.0
 
 # ==================== АРХИВ ====================
 ARCHIVE_FOLDER = "archive"
@@ -178,7 +180,7 @@ ARCHIVE_FOLDER = "archive"
 MAP_UPDATE_MS = 1000
 RESULT_TIMER_MS = 200
 JOIN_TIMEOUT_SEC = 3.0
-REFRESH_TIMER_MS = 500
+REFRESH_TIMER_MS = 400
 BLINK_TIMER_MS = 500
 
 # ==================== DAQ ПАРАМЕТРЫ ====================
@@ -197,7 +199,7 @@ MAX_TRACKERS = 3
 P_MIN_DURATION_SEC = 0.3
 P_MAX_DURATION_SEC = 5.0
 NOISE_UPDATE_INTERVAL_SEC = 5.0
-PROC_DIAG_INTERVAL_SEC = 5.0          # v9.6.x: интервал диагностики processor, сек.
+PROC_DIAG_INTERVAL_SEC = 0.0          # v9.6.x: интервал диагностики processor, сек.
                                       # 0 = отключено. 5 = отладка. 30+ = продакшн.
 
 
@@ -241,6 +243,10 @@ P_DETECT_DIFF_N = max(1, int(P_DETECT_DIFF_N))
 # --- STA/LTA в сэмплах (S-пикер в heavy_worker) ---
 S_PICKER_STA_N = max(1, int(S_PICKER_STA_SEC * SAMPLE_RATE))
 S_PICKER_LTA_N = max(1, int(S_PICKER_LTA_SEC * SAMPLE_RATE))
+
+# --- H-STA/LTA для визуализации (в сэмплах) ---
+H_DISPLAY_STA_N = max(1, int(H_DISPLAY_STA_SEC * SAMPLE_RATE))
+H_DISPLAY_LTA_N = max(1, int(H_DISPLAY_LTA_SEC * SAMPLE_RATE))
 
 # --- Snapshot границы ---
 SNAPSHOT_PRE_P_N = int(SNAPSHOT_PRE_P_SEC * SAMPLE_RATE)
@@ -288,6 +294,8 @@ def validate_config():
         f"P_LTA_N ({P_LTA_N}) must be > P_STA_N ({P_STA_N})"
     assert S_PICKER_LTA_N > S_PICKER_STA_N, \
         f"S_PICKER_LTA_N ({S_PICKER_LTA_N}) must be > S_PICKER_STA_N ({S_PICKER_STA_N})"
+    assert H_DISPLAY_LTA_N > H_DISPLAY_STA_N, \
+        f"H_DISPLAY_LTA_N ({H_DISPLAY_LTA_N}) must be > H_DISPLAY_STA_N ({H_DISPLAY_STA_N})"
     assert BUFFER_SIZE > SNAPSHOT_PRE_P_N + SNAPSHOT_POST_P_N, \
         f"BUFFER_SIZE ({BUFFER_SIZE}) must fit full snapshot ({SNAPSHOT_PRE_P_N + SNAPSHOT_POST_P_N})"
     assert FFT_NPERSEG <= SNAPSHOT_PRE_P_N + SNAPSHOT_POST_P_N, \
@@ -402,8 +410,10 @@ def setup_logging():
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
+    # v9.6.17: mode='w' — при старте main.py старые логи обнуляются.
+    # events.log не трогаем — он пишется отдельно, в append-режиме.
     ddd_handler = RotatingFileHandler(
-        'ddd.log', maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
+        'ddd.log', mode='w', maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
     )
     ddd_handler.setLevel(logging.DEBUG)
     ddd_handler.addFilter(MaxLevelFilter(logging.INFO))
@@ -411,7 +421,7 @@ def setup_logging():
     logger.addHandler(ddd_handler)
 
     err_handler = RotatingFileHandler(
-        'error.log', maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
+        'error.log', mode='w', maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
     )
     err_handler.setLevel(logging.WARNING)
     err_handler.setFormatter(formatter)

@@ -1,5 +1,5 @@
 """
-heavy_worker.py v9.6.6
+heavy_worker.py v9.6.10
 Offline обработка snapshot:
 - S-поиск по горизонталям (N/E).
 - Взвешивание N/E по RMS — опционально (config.S_USE_RMS_WEIGHTING).
@@ -219,38 +219,68 @@ def process_snapshot(snapshot):
     if s_end - s_start > 100:
         h_zone = h_data[s_start:s_end]
         try:
-            cft_s = recursive_sta_lta(
+            cft_full = recursive_sta_lta(
                 h_zone,
                 config.S_PICKER_STA_N,
                 config.S_PICKER_LTA_N
             )
-            cft_max = float(np.max(cft_s)) if len(cft_s) > 0 else 0.0
-            cft_mean = float(np.mean(cft_s)) if len(cft_s) > 0 else 0.0
-            triggers = trigger_onset(cft_s, config.S_PICKER_TRIGGER,
-                                     config.S_PICKER_DETRIGGER)
+            # v9.6.14: отрезаем первые 1×LTA — артефакт recursive_sta_lta.
+            skip_n = config.S_PICKER_LTA_N
+
+            # v9.6.15: защита от пустого cft_s.
+            # Если окно S-поиска короче, чем LTA — обрезка съест весь массив.
+            if len(cft_full) <= skip_n:
+                s_pick_info += (f", ERROR: cft_full({len(cft_full)}) <= skip_n({skip_n}) "
+                                f"— окно S-поиска короче LTA")
+                cft_s = np.array([])
+                cft_max = 0.0
+                cft_mean = 0.0
+                triggers = []
+            else:
+                cft_s = cft_full[skip_n:]
+                cft_max = float(np.max(cft_s)) if len(cft_s) > 0 else 0.0
+                cft_mean = float(np.mean(cft_s)) if len(cft_s) > 0 else 0.0
+                triggers = trigger_onset(cft_s, config.S_PICKER_TRIGGER,
+                                         config.S_PICKER_DETRIGGER)
             s_pick_info += (f", cft_max={cft_max:.2f}, cft_mean={cft_mean:.2f}, "
                             f"trig={config.S_PICKER_TRIGGER}, "
-                            f"triggers={len(triggers)}")
+                            f"triggers={len(triggers)}, skip_n={skip_n}")
 
             if len(triggers) > 0:
-                # v9.6.x: берём ПЕРВЫЙ trigger, а не максимум cft.
-                # Артефакт recursive_sta_lta даёт максимум на 1×LTA от начала.
-                # Настоящая S может быть раньше.
+                # v9.6.14: артефактная зона теперь в начале (после обрезки).
+                # Ищем максимум cft среди trigger'ов ВНЕ артефактной зоны.
+                zone_len = max(1, len(cft_s))
                 best_rel = None
-                best_cft = None
+                best_cft = -1.0
+                best_rel_artifact = None
+                best_cft_artifact = -1.0
                 for trg in triggers:
                     on_rel = int(trg[0])
-                    if 0 <= on_rel < len(cft_s):
-                        best_rel = on_rel
-                        best_cft = float(cft_s[on_rel])
-                        break   # первый — берём и выходим
+                    if not (0 <= on_rel < len(cft_s)):
+                        continue
+                    zone_pos_trg = on_rel / zone_len
+                    cft_val = float(cft_s[on_rel])
+                    if zone_pos_trg < 0.10:
+                        # артефактная зона — запомним как запасной вариант
+                        if cft_val > best_cft_artifact:
+                            best_cft_artifact = cft_val
+                            best_rel_artifact = on_rel
+                    else:
+                        # основная зона — ищем максимум
+                        if cft_val > best_cft:
+                            best_cft = cft_val
+                            best_rel = on_rel
+                # Если в основной зоне ничего не нашли — берём артефактный
+                if best_rel is None and best_rel_artifact is not None:
+                    best_rel = best_rel_artifact
+                    best_cft = best_cft_artifact
 
                 if best_rel is not None:
                     s_rel = best_rel
-                    s_idx_global = s_start + s_rel
+                    # v9.6.14: + skip_n — пересчёт из cft_s в h_zone
+                    s_idx_global = s_start + skip_n + s_rel
                     p_s_delta = (s_idx_global - p_idx) / sample_rate
-                    zone_len = s_end - s_start
-                    zone_pos = s_rel / max(1, zone_len)
+                    zone_pos = s_rel / max(1, len(cft_s))
 
                     # --- Проверка 1: амплитуда S > амплитуда P на h ---
                     win_p = int(0.25 * sample_rate)
@@ -264,10 +294,13 @@ def process_snapshot(snapshot):
                     s_amp_ratio = h_s_amp / (h_p_amp + 1e-12)
 
                     # --- Проверка 2: не на границе зоны ---
-                    near_boundary = (zone_pos < 0.05) or (zone_pos > 0.95)
+                    # v9.6.14: нижняя граница (артефакт) отсекается через zone_pos < 0.10,
+                    # здесь проверяем только верхнюю.
+                    near_boundary = (zone_pos > 0.95)
+                    in_artifact_zone = (zone_pos < 0.10)
+                    artifact_reject = in_artifact_zone
 
                     # --- Проверка 3: резкость cft ---
-                    # v9.6.7: baseline по ВСЕЙ зоне, не по началу.
                     cft_baseline = float(np.median(cft_s))
                     if cft_baseline < 0.5:
                         cft_baseline = 0.5
@@ -277,15 +310,17 @@ def process_snapshot(snapshot):
                                     f"p_s_delta={p_s_delta:.3f}s, "
                                     f"zone_pos={zone_pos:.2f}, "
                                     f"s/p_amp={s_amp_ratio:.2f}, "
-                                    f"cft_sharp={cft_sharpness:.2f}")
+                                    f"cft_sharp={cft_sharpness:.2f}, "
+                                    f"art_zone={in_artifact_zone}")
 
                     # Все три проверки
                     pass_min_ps = config.MIN_P_S_TIME_SEC < p_s_delta < config.MAX_P_S_TIME_SEC + 1.0
-                    pass_amp = s_amp_ratio > 1.0
+                    pass_amp = s_amp_ratio > 0.8
                     pass_boundary = not near_boundary
-                    pass_sharpness = cft_sharpness > 1.1
+                    pass_sharpness = cft_sharpness > 1.15
 
-                    if pass_min_ps and pass_amp and pass_boundary and pass_sharpness:
+                    if (pass_min_ps and pass_amp and pass_boundary
+                            and pass_sharpness and not artifact_reject):
                         is_s = True
                         s_pick_info += " -> ACCEPTED"
                     else:
@@ -298,6 +333,8 @@ def process_snapshot(snapshot):
                             fails.append("boundary")
                         if not pass_sharpness:
                             fails.append("sharpness")
+                        if artifact_reject:
+                            fails.append("artifact_zone")
                         s_pick_info += f" -> REJECTED ({','.join(fails)})"
         except Exception as ex:
             s_pick_info += f", ERROR: {ex}"
@@ -458,7 +495,18 @@ def _calculate_azimuth(n_filt, e_filt, s_idx, sample_rate):
             return 0.0, 0.0
         n_win = n_win - np.mean(n_win)
         e_win = e_win - np.mean(e_win)
-        cov = np.cov(n_win, e_win)
+        # v9.6.10: взвешивание N/E по RMS для подавления зашумлённого канала.
+        # N зашумлён наводкой 7.8 Гц — ослабляем его вклад в PCA.
+        rms_n = float(np.std(n_win))
+        rms_e = float(np.std(e_win))
+        if rms_n > 1e-12 and rms_e > 1e-12:
+            rms_ref = np.sqrt(rms_n * rms_e)
+            w_n = rms_ref / rms_n
+            w_e = rms_ref / rms_e
+        else:
+            w_n = 1.0
+            w_e = 1.0
+        cov = np.cov(n_win * w_n, e_win * w_e)
         vals, vecs = np.linalg.eigh(cov)
         idx_max = int(np.argmax(vals))
         v_n, v_e = vecs[:, idx_max]

@@ -686,6 +686,16 @@ class OscilloscopeWidget(pg.PlotWidget):
         self.curve_p = pg.PlotDataItem(pen=pen_p, name='H (N,E)', downsample=DS, clipToView=True)
         self.curve_z = pg.PlotDataItem(pen=pen_z, name='Z', downsample=DS, clipToView=True)
         self.plotItem.addItem(self.curve_p); self.plotItem.addItem(self.curve_z)
+        # v9.6.16: третий график — огибающая H (envelope).
+        self.curve_cft = pg.PlotDataItem(
+            pen=pg.mkPen(color='#ff3232', width=1.2),
+            name='H envelope',
+            downsample=DS,
+            clipToView=True
+        )
+        self.plotItem.addItem(self.curve_cft)
+        self.curve_cft.setVisible(False)
+        self.cft_data = deque(maxlen=SPS)   # буфер для envelope H
         self.curve_p.setVisible(False); self.curve_z.setVisible(False)
         self.p_markers = pg.ScatterPlotItem(symbol='t', size=10,
             brush=pg.mkBrush('#00ff64'), pen=pg.mkPen(color='#004d1a', width=1))
@@ -698,6 +708,15 @@ class OscilloscopeWidget(pg.PlotWidget):
         self._refresh_timer = QTimer()
         self._refresh_timer.timeout.connect(self._refresh)
         self._refresh_timer.start(config.REFRESH_TIMER_MS)
+
+    def update_cft(self, cft_val):
+        if self.mode != 'dual':
+            return
+        try:
+            self.cft_data.append(float(cft_val))
+        except (ValueError, TypeError):
+            return
+        self._dirty = True
 
     def add_point(self, value):
         if self.mode != 'single':
@@ -726,6 +745,7 @@ class OscilloscopeWidget(pg.PlotWidget):
                 self.curve_p.setVisible(True); self.curve_z.setVisible(True)
                 self.raw_data.clear()
             self.dual_t.clear(); self.dual_p.clear(); self.dual_z.clear()
+            self.cft_data.clear()   # v9.6.10
             self.p_marker_times.clear(); self.s_marker_times.clear()
             for item in data_list:
                 if len(item) >= 4:
@@ -813,8 +833,8 @@ class OscilloscopeWidget(pg.PlotWidget):
 
         # === v9.5.8: УПРОЩЁННОЕ РАЗМЕЩЕНИЕ ===
         h_center = -0.02
-        z_center = -0.04
-        y_min = -0.15
+        z_center = -0.01
+        y_min = -0.20
         y_max = +0.15
 
         # v9.6.x: _last_ymax удалён
@@ -842,6 +862,28 @@ class OscilloscopeWidget(pg.PlotWidget):
         p_vis = [tm for tm in self.p_marker_times if t_min <= tm <= t_max]
         s_vis = [tm for tm in self.s_marker_times if t_min <= tm <= t_max]
 
+        # v9.6.16: третий график — огибающая H (envelope).
+        n_cft = len(self.cft_data)
+        if n_cft > 0:
+            env_arr = np.array(self.cft_data, dtype=np.float32)
+            # Привязка к X: те же индексы, что у dual_t.
+            if n_cft < n:
+                pad = n - n_cft
+                env_plot = np.concatenate([np.full(pad, np.nan, dtype=np.float32), env_arr])
+            elif n_cft > n:
+                env_plot = env_arr[-n:]
+            else:
+                env_plot = env_arr
+            # Линейная шкала: envelope в вольтах, рисуем как есть + смещение вниз.
+            cft_center = -0.16
+            cft_scale = 1.0
+            env_display = env_plot * cft_scale + cft_center
+            self.curve_cft.setData(x_arr, env_display)
+            self.curve_cft.setVisible(True)
+        else:
+            self.curve_cft.setData([], [])
+            self.curve_cft.setVisible(False)
+
         if p_vis:
             idx_p = np.searchsorted(t_arr, p_vis, side='left')
             idx_p = np.clip(idx_p, 0, n - 1)
@@ -857,6 +899,16 @@ class OscilloscopeWidget(pg.PlotWidget):
                                    np.full(len(idx_s), y_s, dtype=np.float64))
         else:
             self.s_markers.setData([], [])
+
+    def set_cft_data(self, env_list):
+        """v9.6.16: заменить содержимое cft_data на переданный список envelope."""
+        self.cft_data.clear()
+        for v in env_list:
+            try:
+                self.cft_data.append(float(v))
+            except (ValueError, TypeError):
+                self.cft_data.append(0.0)
+        self._dirty = True
 
 
 class WaterAlarmWidget(QWidget):
