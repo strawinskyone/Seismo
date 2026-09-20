@@ -8,6 +8,8 @@
 # «ВЫЧИСЛЯЕМЫЕ КОНСТАНТЫ». Меняйте только БАЗОВЫЕ параметры
 # (секунды, Гц, мВ, км, В) — производные пересчитаются сами.
 
+import os
+import glob
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -99,7 +101,7 @@ INTEGRATE_FOR_S = False               # True = интегрировать (ск�
 INTEGRATE_TREND_REMOVE_SEC = 5.0      # период удаления линейного тренда при интегрировании.
 
 # ==================== STA/LTA (P-волна) ====================
-P_STA_SEC = 0.1
+P_STA_SEC = 0.05
 P_LTA_SEC = 4.0
 P_TRIGGER_RATIO = 1.5
 P_DETRIGGER_RATIO = 1.05
@@ -199,7 +201,7 @@ MAX_TRACKERS = 3
 P_MIN_DURATION_SEC = 0.3
 P_MAX_DURATION_SEC = 5.0
 NOISE_UPDATE_INTERVAL_SEC = 5.0
-PROC_DIAG_INTERVAL_SEC = 0.0          # v9.6.x: интервал диагностики processor, сек.
+PROC_DIAG_INTERVAL_SEC = 30.0          # v9.6.x: интервал диагностики processor, сек.
                                       # 0 = отключено. 5 = отладка. 30+ = продакшн.
 
 
@@ -403,6 +405,17 @@ def setup_logging():
     logger = logging.getLogger('seismic')
     if logger.handlers:
         return logger
+
+    # v9.6.18: RotatingFileHandler с backupCount всегда открывает в append,
+    # игнорируя mode='w'. Поэтому удаляем файлы и старые ротации вручную.
+    # events.log НЕ трогаем — он пишется отдельно в main.py.
+
+    for pattern in ('ddd.log', 'ddd.log.*', 'error.log', 'error.log.*'):
+        for f in glob.glob(pattern):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter(

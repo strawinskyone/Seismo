@@ -137,6 +137,8 @@ class SeismicProcessor:
         self.diag_abs_max = 0.0
         self.diag_d_max = 0.0
         self.diag_ratio_max = 0.0
+        self.diag_sta_max = 0.0
+        self.diag_lta_at_max = 0.0
         self.diag_interval = max(1, int(config.PROC_DIAG_INTERVAL_SEC * config.SAMPLE_RATE))
         self.detect_warmup_until = time.time() + config.P_LTA_SEC * 5
 
@@ -278,6 +280,11 @@ class SeismicProcessor:
         if self.sta_lta_ratio > self.diag_ratio_max:
             self.diag_ratio_max = self.sta_lta_ratio
 
+        # v9.6.19: пиковые sta/lta в момент максимального sta.
+        if self.sta_val > self.diag_sta_max:
+            self.diag_sta_max = self.sta_val
+            self.diag_lta_at_max = self.lta_val
+
         # 5. Обновление трекеров
         current_idx = self._current_chronological_idx()
         self._update_trackers(current_idx, float(ts), abs_z)
@@ -297,9 +304,10 @@ class SeismicProcessor:
             self.samples_since_diag += 1
             if self.samples_since_diag >= self.diag_interval:
                 # Печатать только если сигнал был интересным
+                # v9.6.19: пишем диагностику только если сигнал реально интересный.
                 interesting = (
-                    self.diag_abs_max > config.P_DETECT_ABS_MIN_V * 0.5 or
-                    self.diag_ratio_max > 1.3
+                    self.diag_abs_max > config.P_DETECT_ABS_MIN_V or     # было 0.5
+                    self.diag_ratio_max > 2.0                            # было 1.3
                 )
                 if interesting:
                     logger.info(
@@ -315,12 +323,17 @@ class SeismicProcessor:
                         f"deriv={self.onsets_rejected_deriv}, "
                         f"guard={self.onsets_rejected_guard}, "
                         f"lta={self.lta_val:.5f}V, "
-                        f"sta={self.sta_val:.5f}V"
+                        f"sta={self.sta_val:.5f}V, "
+                        f"sta_max={self.diag_sta_max:.5f}V, "
+                        f"lta_at_max={self.diag_lta_at_max:.5f}V"
                     )
+
                 self.samples_since_diag = 0
                 self.diag_abs_max = 0.0
                 self.diag_d_max = 0.0
                 self.diag_ratio_max = 0.0
+                self.diag_sta_max = 0.0           # v9.6.19: сброс
+                self.diag_lta_at_max = 0.0         # v9.6.19: сброс
 
         # v9.6.x: принудительный сброс триггера по таймауту
         if self.sta_lta_triggered:
