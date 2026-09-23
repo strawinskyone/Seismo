@@ -109,52 +109,42 @@ class AD7606B:
     def _trigger_conversion(self, pulse_us=10):
         self.pi.gpio_trigger(self.CONVST, pulse_us, 1)
 
-    def _read_raw_bytes(self):
-        self.pi.write(self.CS, 0)
-        count, raw_bytes = self.pi.spi_xfer(self.spi_handle, b'\x00' * 8)
-        self.pi.write(self.CS, 1)
-        if count != 8:
-            raise RuntimeError(f"SPI read mismatch: expected 8, got {count}")
-        return raw_bytes
+    def _read_raw_bytes(self, retries=3):
+        for attempt in range(retries):
+            self.pi.write(self.CS, 0)
+            count, raw_bytes = self.pi.spi_xfer(self.spi_handle, b'\x00' * 8)
+            self.pi.write(self.CS, 1)
+            if count == 8:
+                return raw_bytes
+        raise RuntimeError(f"SPI read mismatch after {retries} retries (got {count})")
 
     def _measure_conversion_time(self, n=25):
-        """Однократное измерение реального времени конверсии при старте."""
-        # Грубая оценка сверху по OSR (чтобы не ждать целую миллисекунду)
-        rough_us = {
-            0x00: 30,
-            0x01: 40,
-            0x02: 50,
-            0x03: 70,
-            0x04: 100,
-            0x05: 180,
-            0x06: 320,
-        }.get(self.osr, 100)
-
+        """Реальное измерение времени конверсии через BUSY."""
         times = []
         for _ in range(n):
             t0 = time.perf_counter()
             self._trigger_conversion()
-
-            # Ждём немного больше rough-оценки
-            deadline = time.perf_counter() + (rough_us + 30) * 1e-6
+            # Ждём падения BUSY (конец конверсии)
+            deadline = time.perf_counter() + 0.005   # максимум 5 мс
             while time.perf_counter() < deadline:
-                pass
-
+                if self.pi.read(self.BUSY) == 0:
+                    break
+            t1 = time.perf_counter()
             self._read_raw_bytes()
-            elapsed_us = (time.perf_counter() - t0) * 1e6
-            times.append(elapsed_us)
+            times.append((t1 - t0) * 1e6)
 
         times = np.array(times)
         median = float(np.median(times))
         p95 = float(np.percentile(times, 95))
         maximum = float(np.max(times))
 
-        used = p95 + max(6.0, p95 * 0.12)
+        # Небольшой запас 10%
+        used = p95 * 1.10
 
         logger.info(
             f"[AD7606B {config.VERSION}] Conversion timing measured ({n} samples):\n"
             f"         median = {median:.1f} µs | 95% = {p95:.1f} µs | max = {maximum:.1f} µs\n"
-            f"         → using {used:.1f} µs (includes safety margin)"
+            f"         → using {used:.1f} µs"
         )
         return used
         

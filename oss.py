@@ -420,14 +420,14 @@ class StandaloneOscilloscope(QMainWindow):
             if len(volts) < 4:
                 continue
 
-            x = float(volts[0])   # CH1 = N (север)
-            y = float(volts[1])   # CH2 = E (восток)
-            z = float(volts[2])   # CH3 = Z (вертикаль)
-            w = float(volts[3])   # CH4 = вода
+            w = float(volts[0])   # CH1 = вода
+            x = float(volts[1])   # CH2 = N (север)
+            y = float(volts[2])   # CH3 = E (восток)
+            z = float(volts[3])   # CH4 = Z (вертикаль)
             ts_i = float(batch_ts[i])
 
             self.last_water_volts = w
-            self.last_water_raw = int(raws[3])
+            self.last_water_raw = int(raws[0])
 
             vector_mag = float(np.sqrt(x*x + y*y + z*z))
             channel_values = {0: x, 1: y, 2: z, 3: vector_mag}

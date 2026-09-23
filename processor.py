@@ -17,6 +17,7 @@ import config
 
 logger = logging.getLogger('seismic')
 flush_logger = logging.getLogger('seismic.flush')
+tail_logger = logging.getLogger('seismic.tail')
 
 class EventTracker:
     def __init__(self, onset_idx, onset_time, p_idx, p_time_abs,
@@ -35,7 +36,12 @@ class EventTracker:
         self.p_end_idx = None
         self.p_end_time = None
         self.flush_delay_logged = False
-       
+
+        # v11.0.0: адаптивное завершение события.
+        self.tail_start_t = None        # момент, когда код впервые упал ниже порога
+        self.tail_lta_ref = None        # LTA в момент входа в TAIL — база для сравнения
+        self.tail_min_elapsed = False   # прошло ли TAIL_MIN_POST_SEC
+
     def update(self, current_idx, current_time, abs_z, adaptive_end_thr):
         if self.state == 'P_RISING':
             if abs_z > self.p_peak:
@@ -46,7 +52,7 @@ class EventTracker:
             if p_duration >= config.P_MIN_DURATION_SEC:
                 drop_from_peak = abs_z < self.p_peak * 0.90
                 after_peak = current_time > self.p_peak_time + 0.1
-                if (drop_from_peak and after_peak):
+                if drop_from_peak and after_peak:
                     self.state = 'P_PEAKED'
                 elif p_duration >= config.P_MAX_DURATION_SEC * 0.5:
                     self.state = 'P_PEAKED'
@@ -64,8 +70,6 @@ class EventTracker:
                     f"(reason={reason}, peak={self.p_peak:.5f}V, "
                     f"thr={adaptive_end_thr:.5f}V, dur={p_duration:.2f}s)"
                 )
-        elif self.state in ('P_ENDED', 'CLOSED'):
-            pass
 
 class SeismicProcessor:
     def __init__(self, event_queue=None, p_onset_callback=None, scope_id_callback=None):
@@ -146,8 +150,11 @@ class SeismicProcessor:
         # v9.6.16: линейный индикатор вместо STA/LTA — не «дышит», показывает амплитуду.
         self.env_h_val = 0.0
         self.env_h_alpha = 1.0 - np.exp(-1.0 / (0.3 * self.sample_rate))  # окно 0.3 с
-        self.h_ratio_callback = None
-
+        # v11.0.1: Z-огибающая и «последние» значения H/Z для отдачи наружу.
+        self.env_z_val = 0.0
+        self.env_z_alpha = 1.0 - np.exp(-1.0 / (config.H_ENV_WIN_SEC * self.sample_rate))
+        self.h_last = 0.0
+        self.z_last = 0.0
         # v9.6.15: полосовой фильтр N/E для h_abs (realtime sosfilt).
         # Убирает наводку 7.8 Гц и низкочастотный дрейф — как в plot_h.py.
         self.sos_h = signal.butter(
@@ -246,6 +253,11 @@ class SeismicProcessor:
 
         # v9.6.16: огибающая H — линейный индикатор для оператора.
         self.env_h_val += self.env_h_alpha * (h_abs - self.env_h_val)
+        # v11.0.1: H-сигнал и Z-сигнал для отдачи в карусель.
+        self.h_last = float(h_abs)
+        self.z_last = float(z_cent)
+        # Огибающая Z.
+        self.env_z_val += self.env_z_alpha * (abs(z_cent) - self.env_z_val)
 
         # --- LTA для детекции P ---
         self.lta_ring[self.lta_ring_idx] = abs_z
@@ -341,12 +353,6 @@ class SeismicProcessor:
                 self.sta_lta_triggered = False
                 logger.info("[PROC] STA/LTA trigger force reset (timeout)")
 
-        if self.h_ratio_callback:
-            try:
-                self.h_ratio_callback(self.env_h_val)
-            except Exception:
-                pass			
-
         return z_cent
 
 
@@ -373,11 +379,16 @@ class SeismicProcessor:
         if self.sta_lta_triggered:
             return False
 
+        # v10.0.5: блокируем новый ONSET на EVENT_DEBOUNCE_MS от последнего.
         debounce_sec = config.EVENT_DEBOUNCE_MS / 1000.0
         for closed_t, _ in self.recent_events:
             if abs(current_t - closed_t) < debounce_sec:
                 self.onsets_rejected_guard += 1
                 return False
+        last_any = getattr(self, '_last_any_onset_t', 0.0)
+        if current_t - last_any < debounce_sec:
+            self.onsets_rejected_guard += 1
+            return False
 
         for trk in self.active_trackers:
             if trk.state in ('P_RISING', 'P_PEAKED'):
@@ -416,7 +427,8 @@ class SeismicProcessor:
         )
         self.active_trackers.append(tracker)
         self.sta_lta_triggered = True
-        self.last_sta_lta_onset_t = time.time()   # v9.6.x
+        self.last_sta_lta_onset_t = time.time()
+        self._last_any_onset_t = current_t
         self.onsets_total += 1
 
         logger.info(
@@ -434,15 +446,66 @@ class SeismicProcessor:
 
     def _update_trackers(self, current_idx, current_t, abs_z):
         for tracker in self.active_trackers:
+            # --- Фазы P ---
             if tracker.state in ('P_RISING', 'P_PEAKED'):
                 thr = self._adaptive_p_end_threshold(tracker)
                 prev_state = tracker.state
                 tracker.update(current_idx, current_t, abs_z, thr)
-                # v9.6.x: фиксируем P_END в recent_events СРАЗУ,
-                # а не при flush snapshot. Иначе debounce не работает,
-                # и один сигнал даёт цепочку трекеров.
                 if prev_state != 'P_ENDED' and tracker.state == 'P_ENDED':
-                    self.recent_events.append((tracker.p_end_time, tracker.p_time_abs))
+                    self.recent_events.append(
+                        (tracker.p_end_time, tracker.p_time_abs))
+                continue
+
+            # --- P_ENDED → TAIL ---
+            if tracker.state == 'P_ENDED':
+                if tracker.tail_lta_ref is None:
+                    tracker.tail_lta_ref = max(self.lta_val, self.lta_floor)
+                    tracker.tail_start_t = None
+                    tracker.state = 'TAIL'
+                    logger.info(
+                        f"[TRACKER#{tracker.scope_id}] → TAIL @ {current_t:.3f} "
+                        f"(lta_ref={tracker.tail_lta_ref:.5f}V)"
+                    )
+                continue
+
+            # --- TAIL: ждём затухания кода ---
+            if tracker.state == 'TAIL':
+                # 1. Минимальная длительность TAIL после P_END.
+                if tracker.p_end_time is not None:
+                    since_p_end = current_t - tracker.p_end_time
+                    if since_p_end < config.TAIL_MIN_POST_SEC:
+                        continue
+
+                # 2. Порог затухания: abs_z < lta_ref * TAIL_DECAY_FACTOR.
+                decay_thr = tracker.tail_lta_ref * config.TAIL_DECAY_FACTOR
+                decay_thr = max(decay_thr, self.lta_floor * config.TAIL_DECAY_FACTOR)
+
+                if abs_z < decay_thr:
+                    if tracker.tail_start_t is None:
+                        tracker.tail_start_t = current_t
+                    held = current_t - tracker.tail_start_t
+                    if held >= config.TAIL_HOLD_SEC:
+                        tracker.state = 'CLOSED'
+                        tracker.p_end_idx = tracker.p_end_idx or current_idx
+                        tracker.p_end_time = tracker.p_end_time or current_t
+                        logger.info(
+                            f"[TRACKER#{tracker.scope_id}] → CLOSED @ {current_t:.3f} "
+                            f"(decay_thr={decay_thr:.5f}V, "
+                            f"held={held:.2f}s, "
+                            f"tail={current_t - tracker.p_end_time:.2f}s)"
+                        )
+                else:
+                    if tracker.tail_start_t is not None:
+                        tail_logger.debug(
+                            f"[TRACKER#{tracker.scope_id}] TAIL reset: "
+                            f"abs_z={abs_z:.5f}V >= thr={decay_thr:.5f}V"
+                        )
+                    tracker.tail_start_t = None
+                continue
+
+            # --- CLOSED: ничего не делаем, ждём _flush_ended_trackers ---
+            if tracker.state == 'CLOSED':
+                continue
 
     def _refine_active_onsets(self):
         for tracker in self.active_trackers:
@@ -512,84 +575,153 @@ class SeismicProcessor:
         return float(t_chron[onset_idx_global]), onset_idx_global
 
     def get_snapshot(self, p_time_abs, p_end_idx, tracker):
+        """
+        v11.0.0: границы snapshot определяются адаптивно:
+        - pre  = SNAPSHOT_PRE_P_N (фиксировано — нужно для LTA-оценки),
+        - post = max(P_END + SNAPSHOT_MIN_POST_SEC, tail_end),
+                 но не более SNAPSHOT_POST_P_N.
+        """
         n, e, z, t = self._get_chronological()
         if len(t) == 0:
             return None
         p_idx = int((p_time_abs - t[0]) * self.sample_rate)
         p_idx = max(0, min(p_idx, len(t) - 1))
+
         pre_samples = config.SNAPSHOT_PRE_P_N
-        post_samples = config.SNAPSHOT_POST_P_N
+        post_max = config.SNAPSHOT_POST_P_N
+
+        # --- Адаптивное post-окно ---
+        if tracker.p_end_time is not None:
+            p_end_samp = int((tracker.p_end_time - t[0]) * self.sample_rate)
+            post_adaptive = max(
+                p_end_samp - p_idx + config.SNAPSHOT_MIN_POST_N,
+                config.SNAPSHOT_MIN_POST_N
+            )
+            # Учитываем момент CLOSED, если он позже P_END.
+            if tracker.state == 'CLOSED' and tracker.tail_start_t is not None:
+                closed_samp = int((tracker.tail_start_t - t[0]) * self.sample_rate)
+                post_adaptive = max(post_adaptive,
+                                    closed_samp - p_idx + config.SNAPSHOT_MIN_POST_N)
+            post_samples = min(post_max, int(post_adaptive))
+        else:
+            post_samples = post_max
+
         a = max(0, p_idx - pre_samples)
         b = min(len(t), p_idx + post_samples)
+        if b - a < 50:
+            return None
+
         if tracker.p_end_time is not None:
-            p_end_snapshot = int((tracker.p_end_time - t[0]) * self.sample_rate) - a
+            p_end_snapshot = int((tracker.p_end_time - t[0])
+                                 * self.sample_rate) - a
             p_end_snapshot = max(0, min(p_end_snapshot, b - a - 1))
         else:
             p_end_snapshot = None
+
         return {
-            'n': n[a:b].copy(), 'e': e[a:b].copy(), 'z': z[a:b].copy(), 't': t[a:b].copy(),
-            'p_idx': p_idx - a, 'p_end_idx': p_end_snapshot,
-            'sample_rate': self.sample_rate, 'scope_id': tracker.scope_id,
+            'n': n[a:b].copy(),
+            'e': e[a:b].copy(),
+            'z': z[a:b].copy(),
+            't': t[a:b].copy(),
+            'p_idx': p_idx - a,
+            'p_end_idx': p_end_snapshot,
+            'sample_rate': self.sample_rate,
+            'scope_id': tracker.scope_id,
         }
 
     def _flush_ended_trackers(self):
+        """
+        v11.0.0: трекер отправляется в heavy_worker не по фиксированному
+        SNAPSHOT_POST_P_SEC, а по tail_end_time (момент CLOSED) + минимум
+        SNAPSHOT_MIN_POST_SEC после P_END.
+        """
         ready = []
         remaining = []
         for tracker in self.active_trackers:
-            if tracker.state == 'P_ENDED':
-                required_t = tracker.p_time_abs + config.SNAPSHOT_POST_P_SEC
+            if tracker.state == 'CLOSED':
+                # Нижняя граница: P_END + SNAPSHOT_MIN_POST_SEC.
+                if tracker.p_end_time is None:
+                    tracker.p_end_time = tracker.p_time_abs + 0.5
+                required_t = tracker.p_end_time + config.SNAPSHOT_MIN_POST_SEC
+
+                # Верхняя граница: не длиннее физического максимума.
+                max_t = tracker.p_time_abs + config.SNAPSHOT_POST_P_SEC
+                required_t = min(required_t, max_t)
+
                 if self.latest_t < required_t:
                     if not tracker.flush_delay_logged:
                         flush_logger.debug(
                             f"[FLUSH-DELAY] Tracker P@{tracker.p_time_abs:.3f} "
-                            f"отложен до {required_t:.3f} (latest={self.latest_t:.3f})"
+                            f"ждёт {required_t:.3f} (latest={self.latest_t:.3f})"
                         )
                         tracker.flush_delay_logged = True
                     remaining.append(tracker)
                     continue
-                snapshot = self.get_snapshot(tracker.p_time_abs, tracker.p_end_idx, tracker)
+
+                snapshot = self.get_snapshot(
+                    tracker.p_time_abs, tracker.p_end_idx, tracker)
                 if snapshot is not None:
                     ready.append(snapshot)
-                tracker.state = 'CLOSED'
-                self.recent_events.append((tracker.p_end_time, tracker.p_time_abs))
+                self.recent_events.append(
+                    (tracker.p_end_time, tracker.p_time_abs))
             else:
                 remaining.append(tracker)
         self.active_trackers = remaining
 
         cutoff = time.time() - (config.EVENT_DEBOUNCE_MS / 1000.0) * 2
-        self.recent_events = [(ct, pt) for ct, pt in self.recent_events if ct > cutoff]
+        self.recent_events = [(ct, pt) for ct, pt in self.recent_events
+                              if ct > cutoff]
 
         for snapshot in ready:
             if self.event_queue is not None:
                 try:
                     self.event_queue.put(snapshot, block=False)
                     p_t = snapshot['t'][snapshot['p_idx']]
-                    pe_t = snapshot['t'][snapshot['p_end_idx']]
+                    pe_t = snapshot['t'][snapshot['p_end_idx']] \
+                        if snapshot['p_end_idx'] is not None else p_t
                     logger.info(
                         f"[DISPATCHER] Snapshot sent "
                         f"(P @ {p_t:.3f}, P_end @ {pe_t:.3f}, "
-                        f"len={len(snapshot['z'])}, scope={snapshot['scope_id']}, "
-                        f"trackers_active={len(self.active_trackers)}, "
-                        f"buf_filled={self.buf_filled})"
+                        f"len={len(snapshot['z'])}, "
+                        f"scope={snapshot['scope_id']}, "
+                        f"active={len(self.active_trackers)})"
                     )
                 except Exception:
                     logger.warning("[DISPATCHER] QUEUE FULL, event dropped")
 
     def process_batch(self, batch_raws, batch_timestamps):
+        """
+        v11.0.1: возвращает 4 списка для карусели.
+        h_list     — H-сигнал (фильтрованный, центрированный)
+        z_list     — Z-сигнал (фильтрованный, центрированный)
+        env_h_list — огибающая H
+        env_z_list — огибающая Z
+        """
+        h_list, z_list, env_h_list, env_z_list = [], [], [], []
         for raw, ts in zip(batch_raws, batch_timestamps):
-            if len(raw) < 3:
+            if len(raw) < 4:
+                h_list.append(self.h_last)
+                z_list.append(self.z_last)
+                env_h_list.append(self.env_h_val)
+                env_z_list.append(self.env_z_val)
                 continue
-            n_raw = float(raw[0]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_N
-            e_raw = float(raw[1]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_E
-            z_raw = float(raw[2]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_Z
+            n_raw = float(raw[1]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_N
+            e_raw = float(raw[2]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_E
+            z_raw = float(raw[3]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_Z
             self._process_sample(n_raw, e_raw, z_raw, float(ts))
+            h_list.append(self.h_last)
+            z_list.append(self.z_last)
+            env_h_list.append(self.env_h_val)
+            env_z_list.append(self.env_z_val)
+        return h_list, z_list, env_h_list, env_z_list
 
     def process_single(self, raw, timestamp):
-        if len(raw) < 3:
+        if len(raw) < 4:
             return None
-        n_raw = float(raw[0]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_N
-        e_raw = float(raw[1]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_E
-        z_raw = float(raw[2]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_Z
+        # v10.0.1: A0=вода, сдвиг N/E/Z на A1/A2/A3.
+        n_raw = float(raw[1]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_N
+        e_raw = float(raw[2]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_E
+        z_raw = float(raw[3]) * config.ADC_SCALE_V * config.GAIN_CORRECTION_Z
         self._process_sample(n_raw, e_raw, z_raw, float(timestamp))
         return None
 
@@ -600,4 +732,4 @@ class SeismicProcessor:
             'rejected_by_derivative': self.onsets_rejected_deriv,
             'rejected_by_guard': self.onsets_rejected_guard,
             'rejected_by_max_trackers': self.onsets_rejected_max,
-        }
+            }

@@ -1,5 +1,5 @@
 """
-heavy_worker.py v9.6.10
+heavy_worker.py v9.6.25
 Offline обработка snapshot:
 - S-поиск по горизонталям (N/E).
 - Взвешивание N/E по RMS — опционально (config.S_USE_RMS_WEIGHTING).
@@ -23,7 +23,7 @@ import os
 import time
 import glob
 import numpy as np
-from obspy.signal.trigger import recursive_sta_lta, trigger_onset
+from obspy.signal.trigger import classic_sta_lta, trigger_onset
 from scipy.signal import welch, butter, sosfiltfilt
 import logging
 
@@ -36,7 +36,10 @@ logger = logging.getLogger('seismic')
 # СОХРАНЕНИЕ NPZ
 # ============================================================
 SNAPSHOT_DIR = "snapshots"
-SNAPSHOT_MAX_FILES = 1000
+SNAPSHOT_MAX_FILES = 0
+_last_snapshot_time = 0.0
+_last_snapshot_az = 0.0
+_last_snapshot_dist = 0.0
 
 
 def _save_snapshot(snapshot, p_idx, p_end_idx, s_idx_global, cft_max,
@@ -44,6 +47,19 @@ def _save_snapshot(snapshot, p_idx, p_end_idx, s_idx_global, cft_max,
                    magnitude, is_s, event_type, confidence, p_s_delta,
                    extra=None):
     """Сохраняет snapshot в snapshots/ для анализа. Ошибки не критичны."""
+    global _last_snapshot_time, _last_snapshot_az, _last_snapshot_dist
+    # v10.0.3: debounce — не сохранять дубликат события.
+    now = time.time()
+    dist = distance if distance is not None else 0.0
+    if (now - _last_snapshot_time < 5.0
+            and abs(azimuth - _last_snapshot_az) < 15.0
+            and abs(dist - _last_snapshot_dist) < 5.0):
+        logger.debug(f"[WORKER] Snapshot debounced (az={azimuth:.1f}, "
+                     f"dist={dist:.1f})")
+        return
+    _last_snapshot_time = now
+    _last_snapshot_az = azimuth
+    _last_snapshot_dist = dist
     try:
         os.makedirs(SNAPSHOT_DIR, exist_ok=True)
         t = snapshot['t']
@@ -138,6 +154,86 @@ def _integrate(data, dt):
         return data.copy()
     return np.cumsum(data) * dt
 
+# ============================================================
+# АДАПТИВНЫЙ S-ПИКЕР (v11.0.0): горизонтальная рамка + AIC
+# ============================================================
+def _noise_floor_h(h_data, p_idx, sample_rate):
+    """
+    Медиана RMS горизонтального вектора H в окне ДО p_idx.
+    H = sqrt(N² + E²). Возвращает s_threshold (В) и диагностику.
+    """
+    win_n = config.S_NOISE_PRE_WIN_N
+    a = max(0, p_idx - win_n)
+    b = max(a + 1, p_idx)             # строго ДО p_idx
+    if b - a < 10:
+        # Мало данных до P — берём начало снапшота.
+        a = 0
+        b = max(10, min(len(h_data), win_n))
+    seg = h_data[a:b].astype(np.float64)
+    if len(seg) < 10:
+        return config.S_MIN_THRESHOLD_MV, 0.0
+
+    # RMS в под-окнах по 0.25 с — устойчиво к одиночным выбросам.
+    sub_n = max(4, int(0.25 * sample_rate))
+    rms_vals = []
+    for i in range(0, len(seg) - sub_n + 1, sub_n):
+        chunk = seg[i:i + sub_n]
+        rms_vals.append(float(np.sqrt(np.mean(chunk ** 2))))
+    if not rms_vals:
+        rms_vals = [float(np.sqrt(np.mean(seg ** 2)))]
+
+    noise_median = float(np.median(rms_vals))
+    s_thr = max(config.S_MIN_THRESHOLD_MV,
+                noise_median * config.S_TRIGGER_FACTOR)
+    return s_thr, noise_median
+
+
+def _aic_pick(h_zone, sample_rate):
+    """
+    AIC-пикер вступления S-волны.
+    Возвращает (rel_idx, aic_curve) или (None, None).
+    AIC(k) = k·log(var(x[0:k])) + (N-k-1)·log(var(x[k+1:N]))
+    Минимум AIC → точка вступления.
+    """
+    n = len(h_zone)
+    if n < 50:
+        return None, None
+    x = h_zone.astype(np.float64)
+    x = x - np.mean(x)
+
+    if getattr(config, 'AIC_USE_HILBERT', True):
+        try:
+            from scipy.signal import hilbert
+            env = np.abs(hilbert(x))
+            x = env
+        except Exception:
+            pass
+
+    # Защита от нулевой дисперсии.
+    eps = 1e-12
+    # Префиксные суммы для быстрого расчёта дисперсии.
+    csum = np.cumsum(x)
+    csum2 = np.cumsum(x ** 2)
+    total = csum[-1]
+    total2 = csum2[-1]
+
+    k = np.arange(1, n - 1)
+    # Дисперсия левой части [0..k]
+    mean_l = csum[k - 1] / k
+    var_l = csum2[k - 1] / k - mean_l ** 2
+    # Дисперсия правой части [k+1..n-1]
+    n_r = n - k - 1
+    mean_r = (total - csum[k]) / n_r
+    var_r = (total2 - csum2[k]) / n_r - mean_r ** 2
+
+    var_l = np.maximum(var_l, eps)
+    var_r = np.maximum(var_r, eps)
+
+    aic = k * np.log(var_l) + n_r * np.log(var_r)
+    aic = np.nan_to_num(aic, nan=np.inf, posinf=np.inf)
+
+    min_rel = int(np.argmin(aic))
+    return min_rel, aic
 
 # ============================================================
 # ОСНОВНАЯ ОБРАБОТКА
@@ -200,13 +296,12 @@ def process_snapshot(snapshot):
 
     h_data = np.sqrt((n_s * w_n) ** 2 + (e_s * w_e) ** 2)
 
-    # Зона S-поиска
-    s_start = p_idx + config.S_SEARCH_START_AFTER_P_N
-    s_end = min(len(h_data), p_idx + config.MAX_P_S_SEARCH_N)
-    guard_skip = int(0.2 * sample_rate)
-    s_start = min(s_start + guard_skip, s_end - 1)
-
-    s_pick_info = (f"h_zone len={s_end - s_start}, s_start={s_start}, s_end={s_end}, "
+    # --------------------------------------------------------
+    # Зона S-поиска: от p_idx + min_post до p_idx + AIC_WIN_POST_P_N
+    # --------------------------------------------------------
+    s_start = p_idx + config.AIC_MIN_POST_P_N
+    s_end = min(len(h_data), p_idx + config.AIC_WIN_POST_P_N)
+    s_pick_info = (f"h_zone=[{s_start}:{s_end}] len={s_end - s_start}, "
                    f"w_n={w_n:.2f}, w_e={w_e:.2f}")
     is_s = False
     p_s_delta = None
@@ -215,36 +310,129 @@ def process_snapshot(snapshot):
     s_amp_ratio = None
     zone_pos = None
     cft_sharpness = None
+    aic_min_val = None
+
+    # === Горизонтальная (амплитудная) рамка ===
+    s_threshold, noise_median_h = _noise_floor_h(h_data, p_idx, sample_rate)
+    s_pick_info += (f", noise_H={noise_median_h*1000:.3f}mV, "
+                    f"s_thr={s_threshold*1000:.3f}mV")
+
+    if s_end - s_start > 50:
+        h_zone = h_data[s_start:s_end]
+
+        # --- 1. STA/LTA как вспомогательный признак ---
+        try:
+            cft_full = classic_sta_lta(
+                h_zone, config.S_PICKER_STA_N, config.S_PICKER_LTA_N
+            )
+            cft_full = np.nan_to_num(cft_full, nan=0.0,
+                                     posinf=0.0, neginf=0.0)
+            cft_max = float(np.max(cft_full))
+            s_pick_info += f", cft_max={cft_max:.2f}"
+        except Exception as ex:
+            cft_full = None
+            s_pick_info += f", cft_ERROR={ex}"
+
+        # --- 2. AIC-пикер: глобальный минимум ---
+        try:
+            aic_rel, aic_curve = _aic_pick(h_zone, sample_rate)
+        except Exception as ex:
+            aic_rel, aic_curve = None, None
+            s_pick_info += f", aic_ERROR={ex}"
+
+        if aic_rel is not None:
+            aic_min_val = float(aic_curve[aic_rel])
+            s_idx_global = s_start + int(aic_rel)
+            p_s_delta = (s_idx_global - p_idx) / sample_rate
+            zone_pos = aic_rel / max(1, len(h_zone))
+            s_pick_info += (f", AIC_min@{aic_rel} "
+                            f"(pos={zone_pos:.2f}, Δ={p_s_delta:.3f}s)")
+
+            # --- 3. Проверка амплитуды S относительно адаптивного порога ---
+            win_s = int(0.25 * sample_rate)
+            s_lo = max(0, s_idx_global - win_s)
+            s_hi = min(len(h_data), s_idx_global + win_s)
+            h_s_amp = float(np.max(np.abs(h_data[s_lo:s_hi]))) if s_hi > s_lo else 0.0
+
+            win_p = int(0.25 * sample_rate)
+            p_lo = max(0, p_idx - win_p)
+            p_hi = min(len(h_data), p_idx + win_p)
+            h_p_amp = float(np.max(np.abs(h_data[p_lo:p_hi]))) if p_hi > p_lo else 0.0
+            s_amp_ratio = h_s_amp / (h_p_amp + 1e-12)
+
+            # --- 4. Резкость AIC (насколько глубок минимум) ---
+            if aic_curve is not None and len(aic_curve) > 10:
+                aic_med = float(np.median(aic_curve))
+                aic_std = float(np.std(aic_curve)) + 1e-12
+                aic_sharpness = (aic_med - aic_min_val) / aic_std
+            else:
+                aic_sharpness = 0.0
+
+            # --- 5. Согласованность с STA/LTA (если есть) ---
+            if cft_full is not None and len(cft_full) > int(aic_rel):
+                cft_at_pick = float(cft_full[int(aic_rel)])
+            else:
+                cft_at_pick = 0.0
+
+            s_pick_info += (f", s/p_amp={s_amp_ratio:.2f}, "
+                            f"aic_sharp={aic_sharpness:.2f}, "
+                            f"cft@pick={cft_at_pick:.2f}")
+
+            # --- Проверки ---
+            pass_amp = (h_s_amp >= s_threshold) and (s_amp_ratio > config.S_AMP_RATIO_MIN)
+            pass_sharp = aic_sharpness > 0.5          # мягкий порог
+            pass_pos = 0.02 < zone_pos < 0.98         # не на границе окна
+            pass_cft = (cft_full is None) or (cft_at_pick > config.S_PICKER_TRIGGER * 0.5)
+
+            if pass_amp and pass_sharp and pass_pos and pass_cft:
+                is_s = True
+                s_pick_info += " -> ACCEPTED"
+            else:
+                fails = []
+                if not pass_amp:
+                    fails.append(f"amp({h_s_amp*1000:.2f}mV<{s_threshold*1000:.2f}mV or r={s_amp_ratio:.2f})")
+                if not pass_sharp:
+                    fails.append(f"sharp({aic_sharpness:.2f})")
+                if not pass_pos:
+                    fails.append(f"pos({zone_pos:.2f})")
+                if not pass_cft:
+                    fails.append(f"cft({cft_at_pick:.2f})")
+                s_pick_info += f" -> REJECTED ({','.join(fails)})"
+                p_s_delta = None
+                s_idx_global = None
+        else:
+            s_pick_info += " -> AIC не дал пик"
+    else:
+        s_pick_info += " -> окно слишком короткое"
+        logger.warning(f"[WORKER] S-окно короткое: {s_end - s_start}")
 
     if s_end - s_start > 100:
         h_zone = h_data[s_start:s_end]
         try:
-            cft_full = recursive_sta_lta(
+            # v9.6.24: classic_sta_lta вместо recursive_sta_lta.
+            # recursive даёт артефакт на переходном процессе (~3×LTA),
+            # что давало zone_pos=0.00 и REJECTED (artifact_zone) на
+            # реальных событиях. classic — не имеет этого артефакта,
+            # но даёт nan на первых LTA_N отсчётах (окно не заполнено).
+            cft_full = classic_sta_lta(
                 h_zone,
                 config.S_PICKER_STA_N,
                 config.S_PICKER_LTA_N
             )
-            # v9.6.14: отрезаем первые 1×LTA — артефакт recursive_sta_lta.
-            skip_n = config.S_PICKER_LTA_N
+            # Заменяем nan → 0 (trigger_onset не переносит nan).
+            cft_full = np.nan_to_num(cft_full, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # v9.6.15: защита от пустого cft_s.
-            # Если окно S-поиска короче, чем LTA — обрезка съест весь массив.
-            if len(cft_full) <= skip_n:
-                s_pick_info += (f", ERROR: cft_full({len(cft_full)}) <= skip_n({skip_n}) "
-                                f"— окно S-поиска короче LTA")
-                cft_s = np.array([])
-                cft_max = 0.0
-                cft_mean = 0.0
-                triggers = []
-            else:
-                cft_s = cft_full[skip_n:]
-                cft_max = float(np.max(cft_s)) if len(cft_s) > 0 else 0.0
-                cft_mean = float(np.mean(cft_s)) if len(cft_s) > 0 else 0.0
-                triggers = trigger_onset(cft_s, config.S_PICKER_TRIGGER,
-                                         config.S_PICKER_DETRIGGER)
+            # Нет артефакта — skip_n = 0.
+            skip_n = 0
+            cft_s = cft_full
+
+            cft_max = float(np.max(cft_s)) if len(cft_s) > 0 else 0.0
+            cft_mean = float(np.mean(cft_s)) if len(cft_s) > 0 else 0.0
+            triggers = trigger_onset(cft_s, config.S_PICKER_TRIGGER,
+                                     config.S_PICKER_DETRIGGER)
             s_pick_info += (f", cft_max={cft_max:.2f}, cft_mean={cft_mean:.2f}, "
                             f"trig={config.S_PICKER_TRIGGER}, "
-                            f"triggers={len(triggers)}, skip_n={skip_n}")
+                            f"triggers={len(triggers)}, skip_n={skip_n} (classic)")
 
             if len(triggers) > 0:
                 # v9.6.14: артефактная зона теперь в начале (после обрезки).
@@ -349,7 +537,11 @@ def process_snapshot(snapshot):
     # --------------------------------------------------------
     # 3. Азимут — по СЫРЫМ N/E, без весов
     # --------------------------------------------------------
-    azimuth, rectilinearity = _calculate_azimuth(n_s, e_s, s_idx_global, sample_rate)
+    n_p = _bandpass(_detrend_linear(n.copy()), sample_rate,
+                    config.FILTER_FREQMIN, config.FILTER_FREQMAX)
+    e_p = _bandpass(_detrend_linear(e.copy()), sample_rate,
+                    config.FILTER_FREQMIN, config.FILTER_FREQMAX)
+    azimuth, rectilinearity = _calculate_azimuth(n_p, e_p, p_idx, sample_rate)
 
     # --------------------------------------------------------
     # 4. Магнитуда Ml — через СМЕЩЕНИЕ (v9.6.6)
@@ -410,22 +602,13 @@ def process_snapshot(snapshot):
     logger.info("\n".join(report))
 
     # --- Сохранение NPZ ДО отбрасывания по dead_zone ---
-    extra = {
-        'displacement_um': displacement_um,
-        'displacement_mm': displacement_mm,
-        'velocity_mm_s': velocity_mm_s,
-        'f_char': f_char,
-        'dom_freq': dom_freq,
-        's_amp_ratio': s_amp_ratio if s_amp_ratio is not None else np.nan,
-        'zone_pos': zone_pos if zone_pos is not None else np.nan,
-        'cft_sharpness': cft_sharpness if cft_sharpness is not None else np.nan,
-    }
-    _save_snapshot(
-        snapshot, p_idx, p_end_idx, s_idx_global, cft_max,
-        azimuth, rectilinearity, distance, depth,
-        magnitude, is_s, event_type, confidence, p_s_delta,
-        extra=extra
-    )
+    # v9.6.26: snapshots только для событий с S-волной.
+    if is_s:
+        _save_snapshot(
+            snapshot, p_idx, p_end_idx, s_idx_global, cft_max,
+            azimuth, rectilinearity, distance, depth,
+            magnitude, is_s, event_type, confidence, p_s_delta
+        )
 
     if distance is not None and distance <= config.DEAD_ZONE_KM:
         logger.info(f"[WORKER] Событие отброшено: distance={distance:.1f}km <= dead_zone={config.DEAD_ZONE_KM}km")
@@ -495,22 +678,20 @@ def _calculate_azimuth(n_filt, e_filt, s_idx, sample_rate):
             return 0.0, 0.0
         n_win = n_win - np.mean(n_win)
         e_win = e_win - np.mean(e_win)
-        # v9.6.10: взвешивание N/E по RMS для подавления зашумлённого канала.
-        # N зашумлён наводкой 7.8 Гц — ослабляем его вклад в PCA.
-        rms_n = float(np.std(n_win))
-        rms_e = float(np.std(e_win))
-        if rms_n > 1e-12 and rms_e > 1e-12:
-            rms_ref = np.sqrt(rms_n * rms_e)
-            w_n = rms_ref / rms_n
-            w_e = rms_ref / rms_e
-        else:
-            w_n = 1.0
-            w_e = 1.0
-        cov = np.cov(n_win * w_n, e_win * w_e)
+        # v9.6.25: убрано взвешивание N/E по RMS.
+        # Причина: взвешивание обнуляло информацию о соотношении
+        # амплитуд N/E, из-за чего PCA давал азимут, квантованный
+        # по 45° (только 45/135/225/315) независимо от реального.
+        # PCA теперь работает по СЫРЫМ N/E — азимут становится
+        # произвольным, как и должно быть физически.
+        cov = np.cov(n_win, e_win)
         vals, vecs = np.linalg.eigh(cov)
         idx_max = int(np.argmax(vals))
         v_n, v_e = vecs[:, idx_max]
         az = np.degrees(np.arctan2(v_e, v_n)) % 360.0
+        logger.info(f"[AZ-RAW] v_n={v_n:+.3f} v_e={v_e:+.3f} az={az:.1f} "
+                    f"std_n={np.std(n_win):.5f} std_e={np.std(e_win):.5f} "
+                    f"corr={np.corrcoef(n_win, e_win)[0,1]:+.3f}")
         az = (az + config.AZIMUTH_OFFSET) % 360.0
         rect = 1.0 - (np.min(vals) / (np.max(vals) + 1e-10))
         return float(az), float(rect)
@@ -535,28 +716,47 @@ def _calculate_rsam(z_data, p_idx, sample_rate):
 
 
 def _calculate_distance(is_s, p_s_delta):
-    if is_s and p_s_delta and p_s_delta > 0:
-        distance = (p_s_delta * config.VP * config.VS) / (config.VP - config.VS)
-        depth = max(0.0, distance * config.DEPTH_FACTOR - config.DEPTH_OFFSET)
-        return float(distance), float(depth)
-    return None, None
+    """
+    v11.0.0: убраны жёсткие проверки MIN/MAX_P_S_TIME_SEC.
+    Дистанция считается из физики (VP, VS) для любого валидного p_s_delta.
+    Минимальная физическая граница — 0.05 с (защита от деления на шум).
+    """
+    if not is_s or p_s_delta is None or p_s_delta < 0.05:
+        return None, None
+    distance = p_s_delta * config.VP_VS_FACTOR
+    depth = max(0.0, distance * config.DEPTH_FACTOR - config.DEPTH_OFFSET)
+    return float(distance), float(depth)
 
 
-def _classify_event(is_s, depth, distance, spectral_features, rectilinearity, p_s_delta):
+def _classify_event(is_s, depth, distance, spectral_features,
+                    rectilinearity, p_s_delta):
+    """
+    v11.0.0: исправлен мёртвый код. Тип события определяется по спектру
+    независимо от is_s (взрывы тоже дают S-подобные волны), но confidence
+    калибруется раздельно для каждого класса.
+    """
     confidence = 0.75
     if rectilinearity > 0.3:
         confidence += 0.05
     if distance is not None and distance > config.DEAD_ZONE_KM:
         confidence += 0.05
-    if is_s and p_s_delta and 2.0 < p_s_delta < config.MAX_P_S_TIME_SEC + 1.0:
+    if is_s and p_s_delta and p_s_delta > 0:
         confidence += 0.05
+
     dom_freq = spectral_features.get('dominant_freq', 0.0)
     hilo = spectral_features.get('high_to_low_ratio', 0.0)
-    if (dom_freq >= config.EXPLOSION_DOMINANT_FREQ_MIN and
-            hilo > config.EXPLOSION_SPECTRAL_THRESHOLD):
-        if not is_s or (distance is not None and distance < 3.0):
-            return 'explosion', min(0.99, confidence + 0.10)
-    if is_s and p_s_delta and 2.0 < p_s_delta < config.MAX_P_S_TIME_SEC + 1.0 \
-            and depth is not None and depth > 1.0:
-        return 'quake', min(0.99, confidence + 0.10)
+
+    is_spectral_explosion = (
+        dom_freq >= config.EXPLOSION_DOMINANT_FREQ_MIN
+        and hilo > config.EXPLOSION_SPECTRAL_THRESHOLD
+    )
+
+    if is_spectral_explosion:
+        # Взрыв: высокочастотный спектр + слабая S-фаза (обычно) →
+        # не штрафуем за отсутствие is_s, награждаем за спектр.
+        return 'explosion', min(0.99, confidence + 0.10)
+
+    # Землетрясение: награждаем за наличие S и низкочастотный спектр.
+    if is_s and dom_freq < config.EXPLOSION_DOMINANT_FREQ_MIN:
+        confidence += 0.05
     return 'quake', min(0.99, confidence)

@@ -1,5 +1,4 @@
 """
-acquisition_process.py v9.4.0
 DAQ в отдельном процессе (multiprocessing.Process).
 Полностью избавляет от GIL contention между DAQ и GUI.
 """
@@ -129,6 +128,27 @@ class DataAcquisitionProcess(multiprocessing.Process):
             except Exception as e:
                 self.error_counter += 1
                 logger.error(f"[DAQ {config.VERSION}] Error {self.error_counter}/{self.sample_counter}: {e}")
+                # v10.0.1: при Broken pipe — переподключиться к pigpiod.
+                if "Broken pipe" in str(e) or "not connected" in str(e):
+                    logger.warning(f"[DAQ {config.VERSION}] Reconnecting to pigpiod...")
+                    try:
+                        pi.stop()
+                    except Exception:
+                        pass
+                    time.sleep(2.0)
+                    try:
+                        import pigpio
+                        pi = pigpio.pi()
+                        if not pi.connected:
+                            logger.error(f"[DAQ {config.VERSION}] Reconnect failed, pigpiod not running")
+                            time.sleep(5.0)
+                            continue
+                        adc = AD7606B(pi, sample_rate=self.sample_rate)
+                        logger.info(f"[DAQ {config.VERSION}] Reconnected to pigpiod")
+                        self.error_counter = 0
+                    except Exception as e2:
+                        logger.error(f"[DAQ {config.VERSION}] Reconnect error: {e2}")
+                        time.sleep(5.0)
 
             now_mono = time.monotonic()
             elapsed = now_mono - last_diag_time

@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import os, sys, time, numpy as np, logging
 from logging.handlers import RotatingFileHandler
 from multiprocessing import Process, Queue, Event
@@ -11,7 +9,7 @@ from config import *
 from acquisition_process import DataAcquisitionProcess
 from processor import SeismicProcessor
 from heavy_worker import worker_loop
-from widgets import OscilloscopeWidget, MapWidget, WaterAlarmWidget
+from init_widget import OscilloscopeWidget, MapWidget, WaterAlarmWidget
 
 logger = logging.getLogger('seismic')
 events_logger = logging.getLogger('seismic.events')
@@ -48,11 +46,16 @@ class SeismicMonitor(QMainWindow):
             except Exception as e:
                 logger.warning(f"[MAIN] GUI affinity failed (need root): {e}")
         self.event_count = 0; self.last_event_display = ""
+        self._last_event_time = 0.0
+        self._last_event_az = 0.0
+        self._last_event_dist = 0.0
         self.next_scope_id = 4; self.scope_ids = [0, 1, 2, 3]
         self.buffers = [[] for _ in range(CAROUSEL_PANELS)]
         # v9.6.11: буферы cft для каждой панели карусели
-        self.cft_buffers = [[] for _ in range(CAROUSEL_PANELS)]
-        self.last_cft = 0.0   # последнее значение cft (для синхронизации с batch)
+        self.last_h = 0.0
+        self.last_z = 0.0
+        self.last_env_h = 0.0
+        self.last_env_z = 0.0
         print_banner(); self.init_ui()
         self.data_process.start()
         logger.info("[MAIN] DAQ process started")
@@ -67,8 +70,6 @@ class SeismicMonitor(QMainWindow):
             p_onset_callback=lambda t: self.scopes[0].add_p_marker(t))
         self.processor.scope_id_callback = lambda: self.scope_ids[0]
         # v9.6.10: callback для cft-графика на карусели
-        self.processor.h_ratio_callback = self._on_cft_update
-
         self.data_queue = Queue(maxsize=config.DAQ_QUEUE_MAXSIZE)
         self.stop_event = Event()
         self.data_process = DataAcquisitionProcess(
@@ -97,77 +98,124 @@ class SeismicMonitor(QMainWindow):
         self.daq_timer.timeout.connect(self._poll_daq_queue)
         self.daq_timer.start(20)
 
+    def _on_p_onset(self, t):
+        if getattr(self, 'scopes', None):
+            self.scopes[0].add_p_marker(t)        
+
     def _poll_daq_queue(self):
+        batch_count = 0
         while not self.data_queue.empty():
             try:
                 batch = self.data_queue.get_nowait()
                 batch_volts, batch_raws, batch_ts, total_samples, errors = batch
                 self.on_new_data_batch(batch_volts, batch_raws, batch_ts, total_samples, errors)
-            except Exception:
-                break
+                batch_count += 1
+            except Exception as e:
+                logger.error(f"[POLL] Error: {e}", exc_info=True)
+                continue
 
-    def on_new_data_batch(self, batch_volts, batch_raws, batch_ts, total_samples, errors):
-        batch_len = len(batch_volts); self.processor.process_batch(batch_raws, batch_ts)
+    def on_new_data_batch(self, batch_volts, batch_raws, batch_ts,
+                         total_samples, errors):
+        batch_len = len(batch_volts)
+        result = self.processor.process_batch(batch_raws, batch_ts)
+        if result and len(result) == 4:
+            h_b, z_b, eh_b, ez_b = result
+        else:
+            h_b, z_b, eh_b, ez_b = [], [], [], []
+
         for i in range(batch_len):
             volts = batch_volts[i]
-            if len(volts) < 4: continue
-            x, y, z, water = volts; t = batch_ts[i]
-            p_amp = (x*x + y*y) ** 0.5
-            # v9.6.11: cft 
-            self.buffers[0].append((t, x, y, z, p_amp))
-            self.cft_buffers[0].append(self.last_cft)
-            self.scopes[0].update_data(t, x, y, z)
-            self.scopes[0].update_cft(self.last_cft)
+            if len(volts) < 4:
+                continue
+            water, x, y, z = volts
+            t = batch_ts[i]
+
+            h_val  = h_b[i]  if i < len(h_b)  else self.last_h
+            z_val  = z_b[i]  if i < len(z_b)  else self.last_z
+            eh_val = eh_b[i] if i < len(eh_b) else self.last_env_h
+            ez_val = ez_b[i] if i < len(ez_b) else self.last_env_z
+
+            self.last_h = h_val
+            self.last_z = z_val
+            self.last_env_h = eh_val
+            self.last_env_z = ez_val
+
+            # v11.0.1: 5-tuple → (t, h, z, env_h, env_z).
+            self.buffers[0].append((t, h_val, z_val, eh_val, ez_val))
+            self.scopes[0].update_carousel(t, h_val, z_val, eh_val, ez_val)
+
             self.counter += 1
-            if self.counter >= SAMPLES_PER_SCREEN: self._rotate(); self.counter = 0
-            if i == batch_len - 1: self.water_alarm.set_alarm(water > WATER_ALARM_THRESHOLD_V, water)
+            if self.counter >= SAMPLES_PER_SCREEN:
+                self._rotate()
+                self.counter = 0
+            if i == batch_len - 1:
+                self.water_alarm.set_alarm(water > WATER_ALARM_THRESHOLD_V, water)
 
     def _rotate(self):
         for i in range(CAROUSEL_PANELS - 1, 0, -1):
             self.buffers[i] = list(self.buffers[i-1])
-            self.cft_buffers[i] = list(self.cft_buffers[i-1])   # v9.6.11
             self.scope_ids[i] = self.scope_ids[i-1]
             self.scopes[i].set_data(self.buffers[i])
-            self.scopes[i].set_cft_data(self.cft_buffers[i])    # v9.6.11
-        self.buffers[0] = []; self.cft_buffers[0] = []
         self.scope_ids[0] = self.next_scope_id; self.next_scope_id += 1
         self.scopes[0].set_data([])
-        self.scopes[0].set_cft_data([])
 
     def _check_results(self):
         while not self.result_queue.empty():
             try:
                 result = self.result_queue.get_nowait()
-                if not result or result.get('status') != 'event': continue
+                if not result or result.get('status') != 'event':
+                    continue
                 distance = result.get('distance')
-                if distance is not None and distance <= DEAD_ZONE_KM: continue
+                if distance is not None and distance <= DEAD_ZONE_KM:
+                    continue
+                # v9.6.27:
+                peak_mv = result.get('peak_amplitude_mv', 0)
+                if peak_mv < EVENT_THRESHOLD_MV:
+                    continue
+                # v10.0.3: debounce — не дублировать событие, если то же
+                # направление/дистанция в пределах EVENT_DEBOUNCE_MS.
+                now = time.time()
+                az = result.get('azimuth', 0)
+                dist = result.get('distance', 0) or 0
+                debounce_s = EVENT_DEBOUNCE_MS / 1000.0
+                if (now - self._last_event_time <= debounce_s
+                        and abs(az - self._last_event_az) < 25.0
+                        and abs(dist - self._last_event_dist) < 10.0):
+                    continue
                 added = self.map.add_event(result)
-                if not added: continue
+                if not added:
+                    continue
+                self._last_event_time = now
+                self._last_event_az = az
+                self._last_event_dist = dist
                 self.event_count += 1
-                peak_mv = result.get('peak_amplitude_mv', 0); ml = result.get('ml_magnitude', 0)
-                az = result.get('azimuth', 0); conf = result.get('event_confidence', 0)
-                depth = result.get('depth', 0); etype = result.get('event_type', '?'); p_s = result.get('p_s_delta', 0)
+                ml = result.get('ml_magnitude', 0)
+                az = result.get('azimuth', 0)
+                conf = result.get('event_confidence', 0)
+                depth = result.get('depth', 0)
+                etype = result.get('event_type', '?')
+                p_s = result.get('p_s_delta', 0)
                 s_time_abs = result.get('s_time_abs')
-                if s_time_abs: self.scopes[0].add_s_marker(s_time_abs)
+                if s_time_abs:
+                    self.scopes[0].add_s_marker(s_time_abs)
                 dist_str = f"{distance:5.1f}km" if distance is not None else "N/A   "
                 depth_str = f"{depth:4.1f}km" if depth is not None else "N/A "
                 p_s_str = f"{p_s:.2f}s" if p_s and p_s > 0 else "N/A"
                 event_line = (f"EVENT #{self.event_count:03d} | {etype.upper():>6s} | "
-                              f"D={dist_str} | Ml={ml:4.2f} | Az={az:5.1f}° | "
+                              f"D={dist_str} | Ml={ml:4.2f} | Az={az:5.1f}deg | "
                               f"conf={conf:.2f} | depth={depth_str} | peak={peak_mv:5.2f}mV | "
-                              f"ΔP-S={p_s_str}")
-                events_logger.info(event_line); logger.info(f"[EVENT] {event_line}")
-                self.last_event_display = f"#{self.event_count} {etype} {distance:.1f}km"
-                self.setWindowTitle(f"Сейсмостанция {config.VERSION} | {self.last_event_display} | ±{GRAPH_SENSITIVITY_MV}mV")
-            except Exception as e: logger.error(f"[MAIN] Error processing result: {e}"); break
-
-    def _on_cft_update(self, cft_val):
-
-        try:
-            self.last_cft = float(cft_val)
-        except (ValueError, TypeError):
-            pass
-
+                              f"dP-S={p_s_str}")
+                events_logger.info(event_line)
+                logger.info(f"[EVENT] {event_line}")
+                dist_disp = f"{distance:.1f}km" if distance is not None else "N/A"
+                self.last_event_display = f"#{self.event_count} {etype} {dist_disp}"
+                self.setWindowTitle(
+                    f"SeismicStation {config.VERSION} | {self.last_event_display} | "
+                    f"+-{GRAPH_SENSITIVITY_MV}mV"
+                )
+            except Exception as e:
+                logger.error(f"[MAIN] Error processing result: {e}")
+                break
 
     def _update_map(self): self.map.update()
 
@@ -186,16 +234,6 @@ class SeismicMonitor(QMainWindow):
             logger.warning("[MAIN] Heavy worker terminated forcefully")
         event.accept()
 
-#   def keyPressEvent(self, event):
-        # Горячие клавиши главного окна.
-#        key = event.key()
-#        if key == Qt.Key_J:
-#            inject_test_events(self.map, self.scopes)
-#            self.setWindowTitle(
-#                f"Сейсмостанция {config.VERSION} | ТЕСТ: события на карте | ±{GRAPH_SENSITIVITY_MV}mV"
-#            )
-#        else:
-#            super().keyPressEvent(event)
 
 if __name__ == "__main__":
     try: import obspy, scipy, numpy, PyQt5, pyqtgraph
